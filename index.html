@@ -40,6 +40,14 @@
   details summary { cursor:pointer; color:var(--dim); letter-spacing:.1em; text-transform:uppercase; font-size:13px; font-weight:600; }
   details ul { padding-left:18px; margin:6px 0; }
   #toggle { padding:4px 10px; font-size:14px; }
+  select, input[type=text] { font:inherit; font-size:15px; color:var(--txt); background:#1b1e2a; border:1px solid var(--line); border-radius:9px; padding:8px 10px; min-width:0; }
+  .field { display:flex; flex-direction:column; gap:4px; font-size:12px; letter-spacing:.12em; text-transform:uppercase; color:var(--dim); }
+  #linkRow input { flex:3; } #linkRow button { flex:1; }
+  #linkMsg { font-size:14px; color:var(--dim); margin-top:6px; line-height:1.3; }
+  #linkMsg:empty { display:none; }
+  #lib li button.rm { color:var(--dim); padding:3px 7px; }
+  .legend { display:flex; flex-wrap:wrap; gap:4px 12px; font-size:13px; color:var(--dim); margin-top:6px; }
+  .legend i { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:5px; vertical-align:-1px; }
   #drop { position:fixed; inset:0; display:none; align-items:center; justify-content:center; font-size:28px; letter-spacing:.1em;
           background:rgba(7,8,12,.8); border:3px dashed rgba(255,255,255,.3); z-index:10; }
   #drop.show { display:flex; }
@@ -63,7 +71,17 @@
     <div class="row">
       <label class="file">+ Add tracks<input id="fileIn" type="file" accept="audio/*,.mp3,.wav,.m4a,.aac,.flac,.ogg" multiple></label>
     </div>
-    <h2>Library</h2>
+    <div class="row" id="linkRow">
+      <input id="linkIn" type="text" placeholder="Paste a Dropbox, OneDrive or MP3 link" autocomplete="off">
+      <button id="linkBtn">Add link</button>
+    </div>
+    <div id="linkMsg"></div>
+    <div class="row">
+      <label class="field">Waveform<select id="waveSel"></select></label>
+      <label class="field">Visuals<select id="visSel"><option value="full">Full</option><option value="chill">Chill</option><option value="off">Off</option></select></label>
+    </div>
+    <div class="legend" id="legend"></div>
+    <h2>Library <span style="text-transform:none;letter-spacing:0">· saved on this device</span></h2>
     <ul id="lib"></ul>
     <details>
       <summary>How to play</summary>
@@ -74,6 +92,8 @@
         <li><b>SYNC</b> matches tempo and beat phase to the other deck. Moving the tempo fader turns sync off.</li>
         <li>Add your MP3 or WAV files here <i>before</i> entering VR. Then pick them in the library panel on the left of the booth.</li>
         <li><b>VENUE</b> switches between passthrough and a virtual club. <b>RECENTER</b> moves the booth in front of you.</li>
+        <li><b>WAVE</b> cycles the waveform colors, which also recolor the visuals. <b>VISUALS</b> cycles Full, Chill and Off.</li>
+        <li>Tracks you add stay in this browser's library, so you only add them once per headset.</li>
       </ul>
     </details>
   </div>
@@ -93,7 +113,9 @@ const fmtTime = s => { if (!isFinite(s) || s < 0) s = 0; const m = Math.floor(s 
 const FONT = '"Barlow Condensed", system-ui, sans-serif';
 const COL_A = 0x19d3ff, COL_B = 0xff3d9a;
 const CSS_A = '#19d3ff', CSS_B = '#ff3d9a';
-const nextFrame = () => new Promise(r => requestAnimationFrame(() => r()));
+// window.requestAnimationFrame pauses during an immersive session, so yield with a timer instead
+const nextFrame = () => new Promise(r => setTimeout(r, 0));
+const hex2 = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
 
 /* =========================================================
    Audio engine
@@ -154,7 +176,8 @@ class Deck {
     this.buffer = buffer; this.title = title;
     this.bpm = meta.bpm; this.firstBeat = meta.firstBeat;
     this.peaks = meta.peaks; this.peakRate = meta.peakRate;
-    this.overview = buildOverview(meta.peaks, this.css);
+    this.bands = meta.bands || null;
+    refreshDeckColors(this);
     this.pos = 0; this.cue = Math.max(0, meta.firstBeat); this.pos = this.cue;
     this.loop = null; this.synced = false; this.nudge = 1; this.nudgeTarget = 1;
   }
@@ -397,23 +420,84 @@ function detectBPM(buffer) {
   return { bpm, firstBeat };
 }
 
+/* ---------- waveform color styles (same set as SEGUE/32 desktop) ---------- */
+const WAVES = {
+  rgb:   { name: 'RGB',    pal: ['#ff2a1f', '#ff9a1a', '#3bff6a', '#4a7dff'] },
+  ocean: { name: 'Ocean',  pal: ['#8fdcff', '#2f49cf', '#13c4b2', '#a35cff'] },
+  fire:  { name: 'Fire',   pal: ['#e8291d', '#ff8a1f', '#ffd23d', '#fff3df'] },
+  band3: { name: '3-Band', layers: ['#2f6bff', '#ffa733', '#f2f2f2'] },
+  mono:  { name: 'Mono' },
+};
+const WAVE_ORDER = ['rgb', 'ocean', 'fire', 'band3', 'mono'];
+for (const k in WAVES) if (WAVES[k].pal) WAVES[k].prgb = WAVES[k].pal.map(hex2);
+let waveStyle = (() => { try { const v = localStorage.getItem('segue32vr.wave'); return WAVES[v] ? v : 'rgb'; } catch (e) { return 'rgb'; } })();
+
+// Energy in four bands (kicks, basslines, vocals & synths, snares & hats) at the waveform resolution.
+async function computeBands(buffer, perSec = 150) {
+  const sr = 22050, len = Math.max(1, Math.ceil(buffer.duration * sr));
+  const oc = new OfflineAudioContext(4, len, sr);
+  const src = oc.createBufferSource(); src.buffer = buffer;
+  const mono = oc.createGain(); mono.channelCount = 1; mono.channelCountMode = 'explicit'; mono.channelInterpretation = 'speakers';
+  src.connect(mono);
+  const merger = oc.createChannelMerger(4); merger.connect(oc.destination);
+  const f = (type, freq, q = 0.707) => { const b = oc.createBiquadFilter(); b.type = type; b.frequency.value = freq; b.Q.value = q; return b; };
+  const chains = [[f('lowpass', 110), f('lowpass', 110)], [f('highpass', 120), f('lowpass', 420)], [f('highpass', 420), f('lowpass', 4200)], [f('highpass', 5200), f('highpass', 5200)]];
+  chains.forEach((c, j) => { mono.connect(c[0]); c[0].connect(c[1]); c[1].connect(merger, 0, j); });
+  src.start();
+  const out = await oc.startRendering();
+  const n = Math.ceil(buffer.duration * perSec), hop = sr / perSec;
+  const bands = new Float32Array(n * 4);
+  for (let j = 0; j < 4; j++) {
+    const d = out.getChannelData(j); let mx = 1e-9;
+    for (let i = 0; i < n; i++) {
+      const a = Math.floor(i * hop), b = Math.min(d.length, Math.floor((i + 1) * hop));
+      let s = 0, c = 0; for (let k = a; k < b; k += 2) { s += d[k] * d[k]; c++; }
+      const v = c ? Math.sqrt(s / c) : 0; bands[i * 4 + j] = v; if (v > mx) mx = v;
+    }
+    for (let i = 0; i < n; i++) bands[i * 4 + j] /= mx;
+  }
+  return bands;
+}
+
+// Per-moment colors for palette styles, blended by band energy.
+function refreshDeckColors(deck) {
+  const st = WAVES[waveStyle];
+  deck.colors = null;
+  if (st.prgb && deck.bands) {
+    const b = deck.bands, n = b.length / 4, out = new Uint8Array(n * 3), P = st.prgb;
+    for (let i = 0; i < n; i++) {
+      let r = 0, g = 0, bl = 0, s = 0;
+      for (let j = 0; j < 4; j++) { const q = b[i * 4 + j] * b[i * 4 + j]; r += q * P[j][0]; g += q * P[j][1]; bl += q * P[j][2]; s += q; }
+      if (s > 0) { out[i * 3] = r / s; out[i * 3 + 1] = g / s; out[i * 3 + 2] = bl / s; }
+      else { out[i * 3] = P[2][0]; out[i * 3 + 1] = P[2][1]; out[i * 3 + 2] = P[2][2]; }
+    }
+    deck.colors = out;
+  }
+  deck.overview = deck.peaks ? buildOverview(deck) : null;
+}
+
 function analyzeTrack(buffer) {
   const peaks = computePeaks(buffer, 150);
   const { bpm, firstBeat } = detectBPM(buffer);
   return { bpm, firstBeat, peaks, peakRate: 150 };
 }
 
-function buildOverview(peaks, css) {
-  const W = 480, H = 50;
+function buildOverview(deck) {
+  const W = 480, H = 50, peaks = deck.peaks, n = peaks.length;
   const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
   const g = cv.getContext('2d');
-  g.fillStyle = css;
-  const n = peaks.length;
+  const st = WAVES[waveStyle], b = deck.bands, c = deck.colors;
   for (let x = 0; x < W; x++) {
-    const a = Math.floor(x / W * n), b = Math.max(a + 1, Math.floor((x + 1) / W * n));
-    let m = 0; for (let i = a; i < b && i < n; i++) if (peaks[i] > m) m = peaks[i];
-    const h = Math.max(1, m * (H - 4));
-    g.fillRect(x, (H - h) / 2, 1, h);
+    const a = Math.floor(x / W * n), e = Math.max(a + 1, Math.floor((x + 1) / W * n));
+    let m = 0, mi = a; for (let i = a; i < e && i < n; i++) if (peaks[i] > m) { m = peaks[i]; mi = i; }
+    if (st.layers && b) {
+      let lo = 0, md = 0, hi = 0;
+      for (let i = a; i < e && i < n; i++) { lo = Math.max(lo, b[i * 4], b[i * 4 + 1]); md = Math.max(md, b[i * 4 + 2]); hi = Math.max(hi, b[i * 4 + 3]); }
+      [[lo, 0], [md * 0.75, 1], [hi * 0.45, 2]].forEach(([v, k]) => { const h = Math.max(1, v * (H - 4)); g.fillStyle = st.layers[k]; g.fillRect(x, (H - h) / 2, 1, h); });
+    } else {
+      g.fillStyle = c ? `rgb(${c[mi * 3]},${c[mi * 3 + 1]},${c[mi * 3 + 2]})` : deck.css;
+      const h = Math.max(1, m * (H - 4)); g.fillRect(x, (H - h) / 2, 1, h);
+    }
   }
   return cv;
 }
@@ -422,61 +506,78 @@ function buildOverview(peaks, css) {
    Demo tracks (synthesized so the app works with no files)
    ========================================================= */
 async function synthDemo({ bpm, bars, root, chord, bassPat, hatOpen }) {
-  const sr = 44100, beat = 60 / bpm, dur = bars * 4 * beat + 0.6;
-  const oc = new OfflineAudioContext(2, Math.ceil(dur * sr), sr);
-  const out = oc.createGain(); out.gain.value = 0.7; out.connect(oc.destination);
-  const nb = oc.createBuffer(1, sr, sr); const nd = nb.getChannelData(0);
-  for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
-  const kick = (t, v = 1) => {
-    const o = oc.createOscillator(), g = oc.createGain();
-    o.frequency.setValueAtTime(160, t); o.frequency.exponentialRampToValueAtTime(46, t + 0.11);
-    g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(v, t + 0.003); g.gain.exponentialRampToValueAtTime(0.001, t + 0.42);
-    o.connect(g); g.connect(out); o.start(t); o.stop(t + 0.45);
+  // Render each sound once, then place copies in JS. Much faster than scheduling thousands of nodes.
+  const sr = 44100, beat = 60 / bpm, dur = bars * 4 * beat + 0.6, N = Math.ceil(dur * sr);
+  const shot = async (len, fn) => {
+    const oc = new OfflineAudioContext(1, Math.ceil(len * sr), sr);
+    const nb = oc.createBuffer(1, sr, sr); const nd = nb.getChannelData(0);
+    for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
+    fn(oc, oc.destination, nb);
+    return (await oc.startRendering()).getChannelData(0);
   };
-  const hat = (t, v, len) => {
+  const kick = (oc, out) => {
+    const o = oc.createOscillator(), g = oc.createGain();
+    o.frequency.setValueAtTime(160, 0); o.frequency.exponentialRampToValueAtTime(46, 0.11);
+    g.gain.setValueAtTime(0.0001, 0); g.gain.exponentialRampToValueAtTime(1, 0.003); g.gain.exponentialRampToValueAtTime(0.001, 0.42);
+    o.connect(g); g.connect(out); o.start(0); o.stop(0.45);
+  };
+  const hat = (v, len) => (oc, out, nb) => {
     const s = oc.createBufferSource(); s.buffer = nb;
     const f = oc.createBiquadFilter(); f.type = 'highpass'; f.frequency.value = 7500;
-    const g = oc.createGain(); g.gain.setValueAtTime(v, t); g.gain.exponentialRampToValueAtTime(0.001, t + len);
-    s.connect(f); f.connect(g); g.connect(out); s.start(t, Math.random() * 0.8, len + 0.02);
+    const g = oc.createGain(); g.gain.setValueAtTime(v, 0); g.gain.exponentialRampToValueAtTime(0.001, len);
+    s.connect(f); f.connect(g); g.connect(out); s.start(0, Math.random() * 0.5, len + 0.02);
   };
-  const clap = (t, v = 0.5) => {
+  const clap = (oc, out, nb) => {
     const s = oc.createBufferSource(); s.buffer = nb;
     const f = oc.createBiquadFilter(); f.type = 'bandpass'; f.frequency.value = 1600; f.Q.value = 0.9;
-    const g = oc.createGain();
-    g.gain.setValueAtTime(0, t);
-    [0, 0.012, 0.024].forEach(o => { g.gain.setValueAtTime(v, t + o); g.gain.exponentialRampToValueAtTime(v * 0.3, t + o + 0.01); });
-    g.gain.exponentialRampToValueAtTime(0.001, t + 0.22);
-    s.connect(f); f.connect(g); g.connect(out); s.start(t, Math.random() * 0.5, 0.25);
+    const g = oc.createGain(); g.gain.setValueAtTime(0, 0);
+    [0, 0.012, 0.024].forEach(o => { g.gain.setValueAtTime(0.5, o); g.gain.exponentialRampToValueAtTime(0.15, o + 0.01); });
+    g.gain.exponentialRampToValueAtTime(0.001, 0.22);
+    s.connect(f); f.connect(g); g.connect(out); s.start(0, Math.random() * 0.5, 0.25);
   };
-  const bass = (t, freq, len, v = 0.32) => {
+  const bass = (freq, len) => (oc, out) => {
     const o = oc.createOscillator(); o.type = 'sawtooth'; o.frequency.value = freq;
     const f = oc.createBiquadFilter(); f.type = 'lowpass'; f.Q.value = 7;
-    f.frequency.setValueAtTime(220, t); f.frequency.exponentialRampToValueAtTime(1100, t + 0.02); f.frequency.exponentialRampToValueAtTime(240, t + len);
-    const g = oc.createGain(); g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(v, t + 0.006); g.gain.setValueAtTime(v, t + len * 0.7); g.gain.exponentialRampToValueAtTime(0.001, t + len);
-    o.connect(f); f.connect(g); g.connect(out); o.start(t); o.stop(t + len + 0.02);
+    f.frequency.setValueAtTime(220, 0); f.frequency.exponentialRampToValueAtTime(1100, 0.02); f.frequency.exponentialRampToValueAtTime(240, len);
+    const g = oc.createGain(); g.gain.setValueAtTime(0.0001, 0); g.gain.exponentialRampToValueAtTime(0.32, 0.006); g.gain.setValueAtTime(0.32, len * 0.7); g.gain.exponentialRampToValueAtTime(0.001, len);
+    o.connect(f); f.connect(g); g.connect(out); o.start(0); o.stop(len + 0.02);
   };
-  const stab = (t, freqs, len, v = 0.06) => {
-    const f = oc.createBiquadFilter(); f.type = 'lowpass'; f.frequency.setValueAtTime(3200, t); f.frequency.exponentialRampToValueAtTime(700, t + len);
-    const g = oc.createGain(); g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(v, t + 0.01); g.gain.exponentialRampToValueAtTime(0.001, t + len);
+  const stab = (freqs, len, v) => (oc, out) => {
+    const f = oc.createBiquadFilter(); f.type = 'lowpass'; f.frequency.setValueAtTime(3200, 0); f.frequency.exponentialRampToValueAtTime(700, len);
+    const g = oc.createGain(); g.gain.setValueAtTime(0.0001, 0); g.gain.exponentialRampToValueAtTime(v, 0.01); g.gain.exponentialRampToValueAtTime(0.001, len);
     f.connect(g); g.connect(out);
-    freqs.forEach(fr => [-7, 7].forEach(dt => { const o = oc.createOscillator(); o.type = 'sawtooth'; o.frequency.value = fr; o.detune.value = dt; o.connect(f); o.start(t); o.stop(t + len + 0.02); }));
+    freqs.forEach(fr => [-7, 7].forEach(dt => { const o = oc.createOscillator(); o.type = 'sawtooth'; o.frequency.value = fr; o.detune.value = dt; o.connect(f); o.start(0); o.stop(len + 0.02); }));
   };
   const semi = n => root * Math.pow(2, n / 12);
+  const progs = [...new Set(bassPat)];
+  const [kickS, hatS, tickS, clapS, ...rest] = await Promise.all([
+    shot(0.45, kick), shot(0.16, hatOpen ? hat(0.22, 0.12) : hat(0.16, 0.05)), shot(0.06, hat(0.055, 0.03)), shot(0.27, clap),
+    ...progs.map(pr => shot(beat * 0.45, bass(semi(pr), beat * 0.42))),
+    ...progs.map(pr => shot(beat * 0.55, stab(chord.map(c => semi(pr + c + 24)), beat * 0.5, 0.06))),
+    ...progs.map(pr => shot(beat * 3.7, stab(chord.map(c => semi(pr + c + 24)), beat * 3.6, 0.05))),
+  ]);
+  const P = progs.length, bassS = {}, stabS = {}, padS = {};
+  progs.forEach((pr, i) => { bassS[pr] = rest[i]; stabS[pr] = rest[P + i]; padS[pr] = rest[2 * P + i]; });
+  const L = new Float32Array(N);
+  const add = (buf, t, g = 1) => { const o = Math.round(t * sr); const n = Math.min(buf.length, N - o); for (let i = 0; i < n; i++) L[o + i] += buf[i] * g; };
   for (let bar = 0; bar < bars; bar++) {
     const breakdown = bar >= 24 && bar < 28;
     const prog = bassPat[Math.floor(bar / 2) % bassPat.length];
     for (let b = 0; b < 4; b++) {
       const t = (bar * 4 + b) * beat;
-      if (!breakdown) kick(t, b === 0 ? 1 : 0.92);
-      hat(t + beat / 2, hatOpen ? 0.22 : 0.16, hatOpen ? 0.12 : 0.05);
-      if (bar >= 8 && !breakdown) { hat(t + beat / 4, 0.05, 0.03); hat(t + beat * 3 / 4, 0.06, 0.03); }
-      if (bar >= 4 && (b === 1 || b === 3) && !breakdown) clap(t);
-      if (bar >= 8) bass(t + beat / 2, semi(prog), beat * 0.42);
-      if (bar >= 12 && (b === 1 || b === 3)) stab(t + beat * 0.75, chord.map(c => semi(prog + c + 24)), beat * 0.5);
+      if (!breakdown) add(kickS, t, b === 0 ? 1 : 0.92);
+      add(hatS, t + beat / 2);
+      if (bar >= 8 && !breakdown) { add(tickS, t + beat / 4, 0.9); add(tickS, t + beat * 3 / 4); }
+      if (bar >= 4 && (b === 1 || b === 3) && !breakdown) add(clapS, t);
+      if (bar >= 8) add(bassS[prog], t + beat / 2);
+      if (bar >= 12 && (b === 1 || b === 3)) add(stabS[prog], t + beat * 0.75);
     }
-    if (breakdown) stab(bar * 4 * beat, chord.map(c => semi(prog + c + 24)), beat * 3.6, 0.05);
+    if (breakdown) add(padS[prog], bar * 4 * beat);
   }
-  return oc.startRendering();
+  for (let i = 0; i < N; i++) L[i] *= 0.7;
+  const out = new AudioBuffer({ length: N, numberOfChannels: 2, sampleRate: sr });
+  out.copyToChannel(L, 0); out.copyToChannel(L, 1);
+  return out;
 }
 
 /* =========================================================
@@ -518,11 +619,29 @@ rig.position.copy(DESKTOP_RIG);
 scene.add(rig);
 
 /* ---------- venue (virtual club) ---------- */
-const venue = new THREE.Group(); scene.add(venue);
+const stage = new THREE.Group(); scene.add(stage);   // follows the booth so the room stays centered on it
+const venue = new THREE.Group(); stage.add(venue);
+const PAL = [new THREE.Color(), new THREE.Color(), new THREE.Color(), new THREE.Color()];
+const floorU = { uTime: { value: 0 }, uLevel: { value: 0 }, uRipple: { value: 0 }, uAge: { value: 1 }, uInt: { value: 1 }, uC0: { value: PAL[0] }, uC1: { value: PAL[1] } };
 {
-  const floor = new THREE.Mesh(new THREE.CircleGeometry(7, 64), new THREE.MeshStandardMaterial({ color: 0x0b0c12, roughness: 0.35, metalness: 0.6 }));
+  const floor = new THREE.Mesh(new THREE.CircleGeometry(7, 64), new THREE.ShaderMaterial({
+    uniforms: floorU,
+    vertexShader: `varying vec2 vPos; void main(){ vPos = position.xy; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+    fragmentShader: `
+      uniform float uTime, uLevel, uRipple, uAge, uInt; uniform vec3 uC0, uC1; varying vec2 vPos;
+      void main(){
+        float r = length(vPos);
+        vec2 g = abs(fract(vPos * 1.5) - 0.5);
+        float grid = smoothstep(0.46, 0.5, max(g.x, g.y));
+        float fade = smoothstep(7.0, 1.5, r);
+        float ring = exp(-abs(r - (0.6 + uAge * 5.5)) * 4.0) * (1.0 - uAge) * uRipple;
+        vec3 base = vec3(0.016, 0.017, 0.026);
+        vec3 col = base + (grid * mix(uC1, uC0, 0.5 + 0.5 * sin(r * 0.8 - uTime)) * (0.05 + uLevel * 0.3) + uC0 * ring * 0.9) * fade * uInt;
+        gl_FragColor = vec4(col, 1.0);
+        #include <colorspace_fragment>
+      }`,
+  }));
   floor.rotation.x = -Math.PI / 2; venue.add(floor);
-  const grid = new THREE.GridHelper(14, 28, 0x2a2f45, 0x161a28); grid.position.y = 0.002; venue.add(grid);
 }
 const venueBars = [];
 for (let i = 0; i < 16; i++) {
@@ -755,20 +874,22 @@ const vu = { A: [], B: [] };
 
 /* ---------- library wing ---------- */
 const wing = new THREE.Group();
-wing.position.set(-0.9, 0, 0.1); wing.rotation.y = 0.85; rig.add(wing);
+wing.position.set(-0.94, 0, 0.1); wing.rotation.y = 0.85; rig.add(wing);
 {
-  const top = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.9, 0.24), matBody); top.position.set(0, -0.46, 0.03); wing.add(top);
+  const top = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.9, 0.32), matBody); top.position.set(0, -0.46, 0.06); wing.add(top);
 }
 const library = []; let libSel = 0;
 function libMove(d) { if (!library.length) return; libSel = clamp(libSel + d, 0, library.length - 1); libDirty = true; }
-makeButton(wing, -0.09, -0.03, { w: 0.06, d: 0.032, label: 'UP', onPress: () => libMove(-1), lit: () => 0.2 });
-makeButton(wing, -0.09, 0.05, { w: 0.06, d: 0.032, label: 'DOWN', onPress: () => libMove(1), lit: () => 0.2 });
-makeButton(wing, 0.0, -0.03, { w: 0.06, d: 0.032, color: COL_A, label: 'LOAD A', labelColor: CSS_A, onPress: () => library[libSel] && loadEntry(library[libSel], deckA), lit: () => 0.35 });
-makeButton(wing, 0.09, -0.03, { w: 0.06, d: 0.032, color: COL_B, label: 'LOAD B', labelColor: CSS_B, onPress: () => library[libSel] && loadEntry(library[libSel], deckB), lit: () => 0.35 });
+makeButton(wing, -0.09, -0.04, { w: 0.06, d: 0.032, label: 'UP', onPress: () => libMove(-1), lit: () => 0.2 });
+makeButton(wing, -0.09, 0.035, { w: 0.06, d: 0.032, label: 'DOWN', onPress: () => libMove(1), lit: () => 0.2 });
+makeButton(wing, 0.0, -0.04, { w: 0.06, d: 0.032, color: COL_A, label: 'LOAD A', labelColor: CSS_A, onPress: () => library[libSel] && loadEntry(library[libSel], deckA), lit: () => 0.35 });
+makeButton(wing, 0.09, -0.04, { w: 0.06, d: 0.032, color: COL_B, label: 'LOAD B', labelColor: CSS_B, onPress: () => library[libSel] && loadEntry(library[libSel], deckB), lit: () => 0.35 });
 let venueOn = false;
-makeButton(wing, 0.0, 0.05, { w: 0.06, d: 0.032, color: 0xb07dff, label: 'VENUE', onPress: () => { venueOn = !venueOn; applyEnv(); }, lit: () => venueOn ? 1 : 0.15 });
-makeButton(wing, 0.09, 0.05, { w: 0.06, d: 0.032, color: 0xffffff, label: 'RECENTER', onPress: () => { needsRecenter = true; xrFrames = 99; }, lit: () => 0.15 });
-label(wing, 0, 0.125, 'LIBRARY', { color: '#6f7690', size: 0.013, weight: 700 });
+makeButton(wing, 0.0, 0.035, { w: 0.06, d: 0.032, color: 0xb07dff, label: 'VENUE', onPress: () => { venueOn = !venueOn; applyEnv(); }, lit: () => venueOn ? 1 : 0.15 });
+makeButton(wing, 0.09, 0.035, { w: 0.06, d: 0.032, color: 0xffffff, label: 'RECENTER', onPress: () => { needsRecenter = true; xrFrames = 99; }, lit: () => 0.15 });
+makeButton(wing, -0.09, 0.11, { w: 0.06, d: 0.032, color: 0xff9a1a, label: 'WAVE', onPress: () => setWaveStyle(WAVE_ORDER[(WAVE_ORDER.indexOf(waveStyle) + 1) % WAVE_ORDER.length]), lit: () => 0.45 });
+makeButton(wing, 0.0, 0.11, { w: 0.06, d: 0.032, color: 0x3bff6a, label: 'VISUALS', onPress: () => setVisMode(VIS_ORDER[(VIS_ORDER.indexOf(visMode) + 1) % VIS_ORDER.length]), lit: () => visMode === 'off' ? 0.12 : visMode === 'chill' ? 0.45 : 1 });
+label(wing, 0.09, 0.115, 'LIBRARY', { color: '#6f7690', size: 0.013, weight: 700 });
 
 /* ---------- surfaces (printed labels) ---------- */
 function buildSurface(parent, w, d, cx = 0, cz = 0, decorate) {
@@ -814,8 +935,8 @@ surfaceDraws.push(buildSurface(rig, TABLE_W, TABLE_D, 0, 0, (g, X, Z, ppm) => {
   panel(-0.19, 0.19, 'rgba(255,255,255,0.14)');
   panel(0.2, 0.615, 'rgba(255,61,154,0.35)');
 }));
-surfaceDraws.push(buildSurface(wing, 0.28, 0.22, 0, 0.03, (g, X, Z, ppm) => {
-  roundRect(g, X(-0.135), Z(-0.075), 0.27 * ppm, 0.21 * ppm, 0.012 * ppm);
+surfaceDraws.push(buildSurface(wing, 0.28, 0.30, 0, 0.06, (g, X, Z, ppm) => {
+  roundRect(g, X(-0.135), Z(-0.085), 0.27 * ppm, 0.29 * ppm, 0.012 * ppm);
   g.strokeStyle = 'rgba(255,255,255,0.14)'; g.lineWidth = 2; g.stroke();
 }));
 
@@ -879,15 +1000,22 @@ function drawDeckPanel(deck, x0) {
       g.fillRect(Math.round(x), zy, 1, zh);
     }
   }
-  const pk = deck.peaks, pr = deck.peakRate;
+  const pk = deck.peaks, pr = deck.peakRate, st = WAVES[waveStyle], bd = deck.bands, cl = deck.colors;
   g.fillStyle = deck.css;
   for (let x = 0; x < zw; x += 2) {
     const t = deck.pos + (x - zw / 2) / zw * span;
     if (t < 0 || t > deck.duration) continue;
     const i = Math.floor(t * pr), v = pk[i] || 0;
-    const h = Math.max(1, v * (zh - 8));
-    g.globalAlpha = t < deck.pos ? 0.55 : 1;
-    g.fillRect(zx + x, zy + (zh - h) / 2, 2, h);
+    g.globalAlpha = t < deck.pos ? 0.5 : 1;
+    if (st.layers && bd) {
+      const lo = Math.max(bd[i * 4] || 0, bd[i * 4 + 1] || 0), md = bd[i * 4 + 2] || 0, hi = bd[i * 4 + 3] || 0;
+      const L = [lo, md * 0.75, hi * 0.45];
+      for (let k = 0; k < 3; k++) { const h = Math.max(1, L[k] * (zh - 8)); g.fillStyle = st.layers[k]; g.fillRect(zx + x, zy + (zh - h) / 2, 2, h); }
+    } else {
+      if (cl) g.fillStyle = `rgb(${cl[i * 3]},${cl[i * 3 + 1]},${cl[i * 3 + 2]})`;
+      const h = Math.max(1, v * (zh - 8));
+      g.fillRect(zx + x, zy + (zh - h) / 2, 2, h);
+    }
   }
   g.globalAlpha = 1;
   const cueX = zx + zw / 2 + (deck.cue - deck.pos) / span * zw;
@@ -950,7 +1078,7 @@ function drawDisplay() {
 const libCanvas = document.createElement('canvas'); libCanvas.width = 512; libCanvas.height = 512;
 const libTex = new THREE.CanvasTexture(libCanvas); libTex.colorSpace = THREE.SRGBColorSpace;
 {
-  const holder = new THREE.Group(); holder.position.set(0, 0.17, -0.1); holder.rotation.x = -0.22; wing.add(holder);
+  const holder = new THREE.Group(); holder.position.set(0, 0.17, -0.12); holder.rotation.x = -0.22; wing.add(holder);
   const frame = new THREE.Mesh(new THREE.BoxGeometry(0.29, 0.29, 0.016), matBody); frame.position.z = -0.01; holder.add(frame);
   const scr = new THREE.Mesh(new THREE.PlaneGeometry(0.27, 0.27), new THREE.MeshBasicMaterial({ map: libTex, toneMapped: false })); holder.add(scr);
   const stand = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.17, 0.015), matBody); stand.position.set(0, -0.12, -0.02); holder.add(stand);
@@ -982,7 +1110,9 @@ function drawLibrary() {
   }
   if (!library.length) { g.font = `500 20px ${FONT}`; g.fillStyle = '#6f7690'; g.fillText('Add tracks from the page before entering VR', 20, 100); }
   g.font = `500 16px ${FONT}`; g.fillStyle = '#5a6078'; g.textAlign = 'left';
-  g.fillText('UP / DOWN to choose · LOAD A or LOAD B', 20, 492);
+  g.fillText('UP / DOWN to choose · LOAD A or LOAD B', 20, 470);
+  g.fillStyle = '#8a90a3';
+  g.fillText(`WAVE: ${WAVES[waveStyle].name}   ·   VISUALS: ${visMode.toUpperCase()}`, 20, 496);
   libTex.needsUpdate = true; libDirty = false;
 }
 
@@ -998,11 +1128,17 @@ async function loadEntry(entry, deck) {
     let buf = entry.buffer;
     if (!buf) { const ab = await entry.file.arrayBuffer(); buf = await actx.decodeAudioData(ab); }
     await nextFrame();
-    if (!entry.meta) entry.meta = analyzeTrack(buf);
-    else if (!entry.meta.peaks) entry.meta = { ...entry.meta, ...analyzeTrack(buf), bpm: entry.meta.bpm, firstBeat: entry.meta.firstBeat };
+    if (!entry.meta || !entry.meta.bpm) entry.meta = analyzeTrack(buf);
+    else if (!entry.meta.peaks) entry.meta = { ...entry.meta, peaks: computePeaks(buf, 150), peakRate: 150 };
+    if (entry.id && !entry.demo) idbPut({ id: entry.id, name: entry.name, blob: entry.file, bpm: entry.meta.bpm, firstBeat: entry.meta.firstBeat });
     deck.loading = false;
     deck.load(buf, entry.name, entry.meta);
     deck.entry = entry;
+    // band colors are computed after the track is playable, so loading stays fast
+    if (!entry.meta.bands) {
+      computeBands(buf).then(b => { entry.meta.bands = b; if (deck.entry === entry) { deck.bands = b; refreshDeckColors(deck); } })
+        .catch(e => console.warn('band analysis failed', e));
+    }
   } catch (err) {
     console.error(err);
     deck.loading = false; deck.buffer = null; deck.title = 'Could not decode: ' + entry.name;
@@ -1014,7 +1150,8 @@ function addFiles(files) {
   const before = library.length;
   for (const f of files) {
     if (!/^audio\//.test(f.type) && !/\.(mp3|wav|m4a|aac|flac|ogg|aif|aiff)$/i.test(f.name)) continue;
-    library.push({ name: f.name.replace(/\.[^.]+$/, ''), file: f });
+    const e = { id: 't' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7), name: f.name.replace(/\.[^.]+$/, ''), file: f };
+    library.push(e); idbPut({ id: e.id, name: e.name, blob: f });
   }
   if (library.length > before) libSel = before;
   libDirty = true; renderLibUI();
@@ -1032,8 +1169,110 @@ function renderLibUI() {
     ba.onclick = () => { libSel = i; loadEntry(e, deckA); };
     const bb = document.createElement('button'); bb.className = 'lb'; bb.textContent = deckB.entry === e ? '● B' : 'B';
     bb.onclick = () => { libSel = i; loadEntry(e, deckB); };
-    li.appendChild(ba); li.appendChild(bb); libUl.appendChild(li);
+    li.appendChild(ba); li.appendChild(bb);
+    if (!e.demo) {
+      const rm = document.createElement('button'); rm.className = 'rm'; rm.textContent = '×'; rm.title = 'Remove from library';
+      rm.onclick = () => removeEntry(e); li.appendChild(rm);
+    }
+    libUl.appendChild(li);
   });
+}
+function removeEntry(e) {
+  if (deckA.entry === e || deckB.entry === e) { linkMsg.textContent = 'That track is on a deck. Load something else there first.'; return; }
+  const i = library.indexOf(e); if (i < 0) return;
+  library.splice(i, 1); if (e.id) idbDel(e.id);
+  libSel = clamp(libSel, 0, Math.max(0, library.length - 1));
+  libDirty = true; renderLibUI();
+}
+
+/* ---------- saved library (IndexedDB, this browser only) ---------- */
+let dbP = null;
+function idb() {
+  if (!dbP) dbP = new Promise(res => {
+    try {
+      const r = indexedDB.open('segue32vr', 1);
+      r.onupgradeneeded = () => r.result.createObjectStore('tracks', { keyPath: 'id' });
+      r.onsuccess = () => res(r.result); r.onerror = () => res(null); r.onblocked = () => res(null);
+    } catch (e) { res(null); }
+  });
+  return dbP;
+}
+async function idbTx(mode, fn) {
+  const db = await idb(); if (!db) return null;
+  return new Promise(res => {
+    try { const tx = db.transaction('tracks', mode); const r = fn(tx.objectStore('tracks')); tx.oncomplete = () => res(r && r.result); tx.onerror = () => res(null); tx.onabort = () => res(null); }
+    catch (e) { res(null); }
+  });
+}
+function idbPut(rec) { if (!rec.blob) return; idbTx('readwrite', st => st.put({ ...rec, added: rec.added || Date.now() })); }
+function idbDel(id) { idbTx('readwrite', st => st.delete(id)); }
+async function idbAll() { const r = await idbTx('readonly', st => st.getAll()); return Array.isArray(r) ? r.sort((a, b) => (a.added || 0) - (b.added || 0)) : []; }
+
+/* ---------- add from a cloud link ---------- */
+const linkMsg = document.getElementById('linkMsg');
+function directLink(raw) {
+  let url; try { url = new URL(raw.trim()); } catch (e) { return null; }
+  const h = url.hostname;
+  if (/(^|\.)dropbox\.com$/.test(h)) { url.hostname = 'dl.dropboxusercontent.com'; url.searchParams.delete('dl'); url.searchParams.delete('raw'); return { url: url.toString(), host: 'Dropbox' }; }
+  if (h === '1drv.ms' || /onedrive\.live\.com$/.test(h)) {
+    const b64 = btoa(unescape(encodeURIComponent(raw.trim()))).replace(/=+$/, '').replace(/\//g, '_').replace(/\+/g, '-');
+    return { url: `https://api.onedrive.com/v1.0/shares/u!${b64}/root/content`, host: 'OneDrive' };
+  }
+  if (/drive\.google\.com$/.test(h)) {
+    const m = raw.match(/\/d\/([^/?#]+)/) || raw.match(/[?&]id=([^&#]+)/);
+    if (m) return { url: `https://drive.usercontent.google.com/download?id=${m[1]}&export=download&confirm=t`, host: 'Google Drive' };
+  }
+  return { url: url.toString(), host: h };
+}
+function nameFromUrl(u, fallback) {
+  try { const seg = decodeURIComponent(new URL(u).pathname.split('/').filter(Boolean).pop() || ''); if (/\.(mp3|wav|m4a|aac|flac|ogg|aiff?)$/i.test(seg)) return seg.replace(/\.[^.]+$/, ''); } catch (e) {}
+  return fallback;
+}
+async function addFromLink() {
+  const raw = document.getElementById('linkIn').value; if (!raw.trim()) return;
+  const d = directLink(raw);
+  if (!d) { linkMsg.textContent = 'That doesn\'t look like a link.'; return; }
+  linkMsg.textContent = `Downloading from ${d.host}…`;
+  try {
+    const r = await fetch(d.url, { mode: 'cors' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const blob = await r.blob();
+    if (blob.size < 20000) throw new Error('not an audio file');
+    const name = nameFromUrl(raw, nameFromUrl(d.url, `${d.host} track ${library.length + 1}`));
+    const e = { id: 't' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7), name, file: blob };
+    library.push(e); idbPut({ id: e.id, name: e.name, blob });
+    libSel = library.length - 1; libDirty = true; renderLibUI();
+    linkMsg.textContent = `Added “${name}”.`; document.getElementById('linkIn').value = '';
+  } catch (err) {
+    console.warn(err);
+    linkMsg.textContent = `Couldn't load that link (${d.host} may block direct downloads). Use a public share link, or download the file in this browser and add it with + Add tracks.`;
+  }
+}
+document.getElementById('linkBtn').onclick = addFromLink;
+document.getElementById('linkIn').addEventListener('keydown', e => { if (e.key === 'Enter') addFromLink(); });
+
+/* ---------- waveform + visuals selectors ---------- */
+const waveSel = document.getElementById('waveSel'), visSel = document.getElementById('visSel');
+WAVE_ORDER.forEach(k => { const o = document.createElement('option'); o.value = k; o.textContent = WAVES[k].name; waveSel.appendChild(o); });
+waveSel.onchange = () => setWaveStyle(waveSel.value);
+visSel.onchange = () => setVisMode(visSel.value);
+function renderLegend() {
+  const st = WAVES[waveStyle], el = document.getElementById('legend');
+  const names = ['Kicks', 'Basslines', 'Vocals & synths', 'Snares & hats'];
+  el.innerHTML = st.pal ? st.pal.map((c, i) => `<span><i style="background:${c}"></i>${names[i]}</span>`).join('')
+    : st.layers ? ['Lows', 'Mids', 'Highs'].map((n, i) => `<span><i style="background:${st.layers[i]}"></i>${n}</span>`).join('')
+    : '<span>Each deck in its own color</span>';
+  waveSel.value = waveStyle;
+}
+function setWaveStyle(k) {
+  if (!WAVES[k]) return; waveStyle = k;
+  try { localStorage.setItem('segue32vr.wave', k); } catch (e) {}
+  decks.forEach(d => { if (d.peaks) refreshDeckColors(d); });
+  applyPalette(); renderLegend(); libDirty = true;
+}
+function setVisMode(m) {
+  visMode = m; try { localStorage.setItem('segue32vr.vis', m); } catch (e) {}
+  visSel.value = m; libDirty = true; applyEnv();
 }
 document.getElementById('fileIn').addEventListener('change', e => { addFiles(e.target.files); e.target.value = ''; });
 const ui = document.getElementById('ui');
@@ -1056,6 +1295,9 @@ function applyEnv() {
   const show = !inAR || venueOn;
   venue.visible = show;
   scene.background = show ? BG : null;
+  wall.visible = show && visMode !== 'off';
+  particles.visible = visMode !== 'off';
+  lasers.visible = visMode !== 'off';
 }
 
 async function startSession(mode) {
@@ -1316,6 +1558,144 @@ window.addEventListener('resize', () => {
 /* =========================================================
    Main loop
    ========================================================= */
+/* =========================================================
+   Music-reactive visuals
+   ========================================================= */
+const VIS_ORDER = ['full', 'chill', 'off'];
+let visMode = (() => { try { const v = localStorage.getItem('segue32vr.vis'); return VIS_ORDER.includes(v) ? v : 'full'; } catch (e) { return 'full'; } })();
+const feat = { bass: 0, mid: 0, high: 0, beat: 0, lastBeat: null, rippleT: -1e9, spec: new Float32Array(32) };
+const freqBuf = new Uint8Array(masterAn.frequencyBinCount);
+
+// LED wall behind the booth
+const wallU = { uTime: { value: 0 }, uBass: { value: 0 }, uMid: { value: 0 }, uHigh: { value: 0 }, uBeat: { value: 0 }, uInt: { value: 1 },
+  uSpec: { value: feat.spec }, uC0: { value: PAL[0] }, uC1: { value: PAL[1] }, uC2: { value: PAL[2] }, uC3: { value: PAL[3] } };
+const wall = new THREE.Mesh(new THREE.CylinderGeometry(3.4, 3.4, 2.6, 72, 1, true, Math.PI - 0.95, 1.9), new THREE.ShaderMaterial({
+  uniforms: wallU, side: THREE.BackSide,
+  vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+  fragmentShader: `
+    uniform float uTime, uBass, uMid, uHigh, uBeat, uInt; uniform float uSpec[32];
+    uniform vec3 uC0, uC1, uC2, uC3; varying vec2 vUv;
+    void main(){
+      vec2 uv = vec2(1.0 - vUv.x, vUv.y);
+      vec2 p = (uv - vec2(0.5, 0.6)) * vec2(3.0, 1.3);
+      float r = length(p) + 0.001, a = atan(p.y, p.x), t = uTime;
+      float tunnel = pow(0.5 + 0.5 * sin(9.0 / r - t * 2.2 - uBass * 5.0), 6.0) * smoothstep(0.03, 0.4, r);
+      float rays = pow(abs(sin(a * 5.0 + t * 0.35 + uMid * 2.5)), 18.0) * smoothstep(0.1, 0.9, r);
+      vec3 col = mix(uC0, uC1, 0.5 + 0.5 * sin(a * 2.0 + t * 0.4)) * tunnel * (0.3 + uBass * 1.8);
+      col += uC2 * rays * (0.1 + uMid * 1.5);
+      float sx = abs(uv.x - 0.5) * 2.0;
+      int bi = int(clamp(sx * 32.0, 0.0, 31.0));
+      float h = uSpec[bi] * 0.42, cell = step(0.18, fract(sx * 32.0));
+      col += mix(uC3, uC1, uv.y / 0.42) * step(uv.y, h) * cell * 0.95;
+      col += mix(uC2, uC3, (1.0 - uv.y) * 4.0) * step(1.0 - h * 0.45, uv.y) * cell * 0.4;
+      col += uC0 * uBeat * 0.25 * (1.0 - clamp(r, 0.0, 1.0));
+      vec2 g = fract(vUv * vec2(260.0, 70.0));
+      float led = 0.4 + 0.6 * smoothstep(0.0, 0.3, g.x) * smoothstep(0.0, 0.3, g.y) * smoothstep(1.0, 0.7, g.x) * smoothstep(1.0, 0.7, g.y);
+      gl_FragColor = vec4(col * led * uInt, 1.0);
+      #include <colorspace_fragment>
+    }`,
+}));
+wall.position.y = 1.55; venue.add(wall);
+
+// Lasers from a truss behind the booth (also shown in passthrough)
+const lasers = new THREE.Group(); stage.add(lasers);
+const laserGeo = new THREE.CylinderGeometry(0.004, 0.004, 1, 6, 1, true); laserGeo.translate(0, 0.5, 0);
+const beams = [];
+for (let i = 0; i < 10; i++) {
+  const mat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false });
+  const m = new THREE.Mesh(laserGeo, mat);
+  m.position.set(-2.2 + i * (4.4 / 9), 2.9, -2.6); m.scale.set(1, 9, 1); m.frustumCulled = false;
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.025, 10, 8), new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.0, blending: THREE.AdditiveBlending, depthWrite: false }));
+  head.position.copy(m.position);
+  lasers.add(m); lasers.add(head); beams.push({ m, mat, head, i });
+}
+const UP = new THREE.Vector3(0, 1, 0), _tgt = new THREE.Vector3();
+
+// Drifting particles around the room
+const PN = 700;
+const pPos = new Float32Array(PN * 3), pSeed = new Float32Array(PN);
+for (let i = 0; i < PN; i++) {
+  const a = Math.random() * Math.PI * 2, r = 1.4 + Math.random() * 4.6;
+  pPos[i * 3] = Math.cos(a) * r; pPos[i * 3 + 1] = Math.random() * 4; pPos[i * 3 + 2] = Math.sin(a) * r; pSeed[i] = Math.random();
+}
+const pGeo = new THREE.BufferGeometry();
+pGeo.setAttribute('position', new THREE.BufferAttribute(pPos, 3)); pGeo.setAttribute('aSeed', new THREE.BufferAttribute(pSeed, 1));
+const partU = { uTime: { value: 0 }, uHigh: { value: 0 }, uBass: { value: 0 }, uInt: { value: 1 }, uC0: { value: PAL[0] }, uC1: { value: PAL[1] }, uC2: { value: PAL[2] }, uC3: { value: PAL[3] } };
+const particles = new THREE.Points(pGeo, new THREE.ShaderMaterial({
+  uniforms: partU, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+  vertexShader: `
+    uniform float uTime, uHigh, uBass; attribute float aSeed; varying float vSeed;
+    void main(){
+      vec3 p = position;
+      p.y = mod(p.y + uTime * (0.06 + 0.14 * aSeed), 4.0);
+      float an = uTime * 0.04 * (0.4 + aSeed);
+      p.xz = mat2(cos(an), -sin(an), sin(an), cos(an)) * p.xz;
+      vec4 mv = modelViewMatrix * vec4(p, 1.0);
+      gl_PointSize = min(18.0, 26.0 * (0.4 + aSeed) * (1.0 + uHigh * 1.8 + uBass * 0.6) / -mv.z);
+      gl_Position = projectionMatrix * mv; vSeed = aSeed;
+    }`,
+  fragmentShader: `
+    uniform vec3 uC0, uC1, uC2, uC3; uniform float uInt; varying float vSeed;
+    void main(){
+      float d = length(gl_PointCoord - 0.5);
+      float a = smoothstep(0.5, 0.0, d);
+      vec3 c = vSeed < 0.25 ? uC0 : vSeed < 0.5 ? uC1 : vSeed < 0.75 ? uC2 : uC3;
+      gl_FragColor = vec4(c * a * uInt, a * uInt);
+      #include <colorspace_fragment>
+    }`,
+}));
+particles.frustumCulled = false; stage.add(particles);
+
+function visPalette() {
+  const st = WAVES[waveStyle];
+  if (st.pal) return st.pal;
+  if (st.layers) return [st.layers[0], st.layers[1], st.layers[2], '#7f9cff'];
+  return [CSS_A, CSS_B, '#b07dff', '#ffffff'];
+}
+function applyPalette() {
+  const p = visPalette();
+  p.forEach((c, i) => PAL[i].set(c));
+  beams.forEach(b => { b.mat.color.copy(PAL[b.i % 4]); b.head.material.color.copy(PAL[b.i % 4]); });
+}
+const avgBins = (a, b) => { let s = 0; for (let i = a; i < b; i++) s += freqBuf[i]; return s / ((b - a) * 255); };
+function updateVisuals(now, dt) {
+  // follow the booth
+  stage.position.set(rig.position.x, 0, rig.position.z); stage.rotation.y = rig.rotation.y;
+  masterAn.getByteFrequencyData(freqBuf);
+  const bass = avgBins(1, 4), mid = avgBins(4, 40), high = avgBins(40, 170);
+  feat.bass = Math.max(bass, feat.bass - dt * 2.2); feat.mid = Math.max(mid, feat.mid - dt * 2); feat.high = Math.max(high, feat.high - dt * 2.5);
+  for (let k = 0; k < 32; k++) {
+    const lo = Math.floor(Math.pow(200, k / 32)), hi = Math.max(lo + 1, Math.floor(Math.pow(200, (k + 1) / 32)));
+    feat.spec[k] = Math.max(avgBins(lo, hi) * (0.8 + k * 0.025), feat.spec[k] - dt * 1.8);
+  }
+  // beat from the beat grid of the loudest playing deck
+  let lead = null; for (const d of decks) if (d.playing && d.bpm && (!lead || d.level > lead.level)) lead = d;
+  let beat = 0;
+  if (lead && lead.level > 0.12) {
+    const bp = lead.beatPos(), idx = Math.floor(bp), f = bp - idx;
+    beat = Math.pow(1 - f, 4) * lead.level;
+    if (idx !== feat.lastBeat) { feat.lastBeat = idx; if (bass > 0.25) feat.rippleT = now; }
+  }
+  feat.beat = beat;
+  const inten = visMode === 'full' ? 1 : visMode === 'chill' ? 0.45 : 0;
+  const t = now / 1000;
+  wallU.uTime.value = t; wallU.uBass.value = feat.bass; wallU.uMid.value = feat.mid; wallU.uHigh.value = feat.high; wallU.uBeat.value = beat; wallU.uInt.value = 0.25 + inten * 0.75;
+  floorU.uTime.value = t; floorU.uLevel.value = masterLevel; floorU.uAge.value = clamp01((now - feat.rippleT) / 800); floorU.uRipple.value = masterLevel; floorU.uInt.value = 0.3 + inten * 0.7;
+  partU.uTime.value = t; partU.uHigh.value = feat.high; partU.uBass.value = feat.bass; partU.uInt.value = inten * (0.35 + masterLevel * 0.9);
+  if (lasers.visible) {
+    const live = masterLevel > 0.05 ? 1 : 0;
+    for (const b of beams) {
+      const i = b.i, sp = visMode === 'full' ? 1 : 0.4;
+      _tgt.set(Math.sin(t * 0.6 * sp + i * 0.7) * 3.5, 0.3 + 0.9 * (0.5 + 0.5 * Math.sin(t * 0.9 * sp + i * 1.9)), 3.5 + Math.sin(t * 0.3 + i));
+      _tgt.sub(b.m.position).normalize();
+      b.m.quaternion.setFromUnitVectors(UP, _tgt);
+      const on = (i % 2 === (feat.lastBeat || 0) % 2) ? 1 : 0.35;
+      b.mat.opacity = live * inten * (0.12 + feat.high * 0.35 + beat * 0.55 * on);
+      b.head.material.opacity = b.mat.opacity * 1.5;
+    }
+  }
+}
+
 const masterBuf = new Float32Array(masterAn.fftSize);
 const colA = new THREE.Color(COL_A), colB = new THREE.Color(COL_B), colMix = new THREE.Color();
 let lastT = performance.now(), lastDisp = 0;
@@ -1360,6 +1740,7 @@ renderer.setAnimationLoop(() => {
       b.mat.emissiveIntensity = 0.15 + masterLevel * 0.8 + beat * 1.8;
     }
   }
+  updateVisuals(now, dt);
   if (now - lastDisp > 40) { drawDisplay(); lastDisp = now; }
   if (libDirty) drawLibrary();
   renderer.render(scene, camera);
@@ -1372,6 +1753,14 @@ for (const c of controls) if (c.type === 'knob' || c.type === 'fader') c.set(c.v
 setCrossfader(0.5);
 document.fonts && document.fonts.load(`600 20px ${FONT}`).then(() => { surfaceDraws.forEach(f => f()); libDirty = true; }).catch(() => {});
 
+applyPalette(); renderLegend(); visSel.value = visMode; applyEnv();
+idbAll().then(recs => {
+  for (const r of recs) {
+    if (!r.blob || library.some(e => e.id === r.id)) continue;
+    library.push({ id: r.id, name: r.name, file: r.blob, meta: r.bpm ? { bpm: r.bpm, firstBeat: r.firstBeat || 0 } : null });
+  }
+  libDirty = true; renderLibUI();
+});
 (async function boot() {
   const demos = [
     { name: 'Demo · Night Drive', bpm: 124, root: 55, chord: [0, 3, 7], bassPat: [0, 0, 5, 3], hatOpen: true },
@@ -1382,7 +1771,7 @@ document.fonts && document.fonts.load(`600 20px ${FONT}`).then(() => { surfaceDr
     const bufs = await Promise.all(demos.map(d => synthDemo({ ...d, bars: 40 })));
     demos.forEach((d, i) => {
       const meta = { bpm: d.bpm, firstBeat: 0, peaks: computePeaks(bufs[i], 150), peakRate: 150 };
-      library.push({ name: d.name, buffer: bufs[i], meta });
+      library.splice(i, 0, { name: d.name, buffer: bufs[i], meta, demo: true });
     });
     deckA.loading = deckB.loading = false;
     await loadEntry(library[0], deckA);
@@ -1393,7 +1782,7 @@ document.fonts && document.fonts.load(`600 20px ${FONT}`).then(() => { surfaceDr
 })();
 
 // exposed for testing
-window.__segue = { deckA, deckB, detectBPM, synthDemo, controls, setCrossfader, camera, xfader, mixerKnobs, THREE };
+window.__segue = { deckA, deckB, detectBPM, synthDemo, controls, setCrossfader, camera, xfader, mixerKnobs, THREE, setWaveStyle, setVisMode, library, directLink, feat };
 </script>
 </body>
 </html>
