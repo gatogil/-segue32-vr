@@ -69,8 +69,11 @@
     </div>
     <div id="xrMsg">Checking WebXR support…</div>
     <div class="row">
-      <label class="file">+ Add tracks<input id="fileIn" type="file" accept="audio/*,.mp3,.wav,.m4a,.aac,.flac,.ogg" multiple></label>
+      <label class="file">+ Add tracks<input id="fileIn" type="file" accept="audio/*,.mp3,.wav,.m4a,.aac,.flac,.ogg,.zip,application/zip" multiple></label>
       <label class="file">+ Add folder<input id="dirIn" type="file" webkitdirectory multiple></label>
+    </div>
+    <div class="row">
+      <label class="file">⇣ Import SEGUE/32 mix<input id="projIn" type="file" accept=".zip,application/zip"></label>
     </div>
     <div class="row" id="linkRow">
       <input id="linkIn" type="text" placeholder="Paste a Dropbox, OneDrive or MP3 link" autocomplete="off">
@@ -105,6 +108,7 @@
         <li>Add your MP3 or WAV files here <i>before</i> entering VR. Then pick them in the library panel on the left of the booth.</li>
         <li><b>VENUE</b> switches between passthrough and a virtual club. <b>RECENTER</b> moves the booth in front of you.</li>
         <li><b>Scratching:</b> in Turntable style, put your fingertip (or a pinch) on the record and move it back and forth. Let go and it plays on. In CDJ style, the top plate scratches and the outer ring bends the pitch. <b>XF CUT</b> gives the crossfader a sharp cut for scratch tricks.</li>
+        <li><b>From desktop SEGUE/32:</b> use <i>Export project</i> there, get the .segue32.zip onto this device (or share it as a Dropbox link), then tap <b>Import SEGUE/32 mix</b>. The tracks arrive in mix order with the beat grids already set.</li>
         <li><b>TT / CDJ</b> on the mixer switches the deck style.</li>
         <li><b>NEXT SCENE</b> changes the LED wall and laser pattern now. Scenes also change on their own on the timer you pick, at the start of a musical phrase.</li>
         <li><b>WAVE</b> cycles the waveform colors, which also recolor the visuals. <b>VISUALS</b> cycles Full, Chill and Off.</li>
@@ -864,6 +868,20 @@ const edgeMat = new THREE.MeshStandardMaterial({ color: 0x000000, emissive: new 
 {
   const edge = new THREE.Mesh(new THREE.BoxGeometry(TABLE_W, 0.008, 0.004), edgeMat);
   edge.position.set(0, -0.03, TABLE_D / 2 + 0.012); rig.add(edge);
+  const fcv = document.createElement('canvas'); fcv.width = 2048; fcv.height = 200;
+  const fg = fcv.getContext('2d');
+  const drawFront = () => {
+    fg.clearRect(0, 0, 2048, 200);
+    fg.fillStyle = '#0d0e14'; fg.fillRect(0, 0, 2048, 200);
+    const l = fg.createLinearGradient(0, 0, 2048, 0); l.addColorStop(0, 'rgba(25,211,255,0)'); l.addColorStop(0.5, 'rgba(255,255,255,0.25)'); l.addColorStop(1, 'rgba(255,61,154,0)');
+    fg.fillStyle = l; fg.fillRect(0, 6, 2048, 2); fg.fillRect(0, 192, 2048, 2);
+    drawLogo(fg, 1024, 102, 110, { glow: true });
+    frontTex.needsUpdate = true;
+  };
+  const frontTex = new THREE.CanvasTexture(fcv); frontTex.colorSpace = THREE.SRGBColorSpace;
+  const front = new THREE.Mesh(new THREE.PlaneGeometry(1.1, 1.1 * 200 / 2048), new THREE.MeshBasicMaterial({ map: frontTex, toneMapped: false }));
+  front.position.set(0, -0.13, TABLE_D / 2 + 0.0115); rig.add(front);
+  drawFront(); window.__redrawFront = drawFront;
 }
 
 /* =========================================================
@@ -945,6 +963,29 @@ function makeFader(parent, x, z, axis, length, o) {
   return register(c);
 }
 
+/* ---------- SEGUE/32 wordmark: the slash is two overlapping slanted bars, amber into violet ---------- */
+function drawLogo(g, cx, cy, h, opts = {}) {
+  g.save();
+  g.font = `700 ${h}px ${FONT}`; g.textBaseline = 'middle'; g.textAlign = 'left';
+  const segW = g.measureText('SEGUE').width, numW = g.measureText('32').width;
+  const slashW = h * 0.72, gap = h * 0.1, total = segW + gap + slashW + gap + numW;
+  let x = cx - total / 2;
+  if (opts.glow) { g.shadowColor = 'rgba(155,107,255,0.8)'; g.shadowBlur = h * 0.6; }
+  g.fillStyle = opts.text || '#ffffff'; g.fillText('SEGUE', x, cy); x += segW + gap;
+  const grd = g.createLinearGradient(x, cy + h * 0.5, x + slashW, cy - h * 0.5);
+  grd.addColorStop(0, '#ffb547'); grd.addColorStop(1, '#9b6bff');
+  const bar = (ox, alpha) => {
+    const bw = h * 0.2, lean = h * 0.32;
+    g.globalAlpha = alpha; g.beginPath();
+    g.moveTo(x + ox, cy + h * 0.46); g.lineTo(x + ox + bw, cy + h * 0.46);
+    g.lineTo(x + ox + bw + lean, cy - h * 0.46); g.lineTo(x + ox + lean, cy - h * 0.46); g.closePath(); g.fill();
+  };
+  g.fillStyle = grd; bar(0, 0.95); bar(h * 0.18, 0.7); g.globalAlpha = 1;
+  x += slashW + gap;
+  g.fillStyle = '#ffb547'; g.fillText('32', x, cy);
+  g.restore();
+}
+
 /* ---------- shared textures for the decks ---------- */
 function makeCanvasTex(w, h, draw) {
   const cv = document.createElement('canvas'); cv.width = w; cv.height = h;
@@ -981,7 +1022,7 @@ function drawRecordLabel(g, W, deck) {
   g.fillStyle = grd; g.beginPath(); g.arc(c, c, c - 1, 0, Math.PI * 2); g.fill();
   g.fillStyle = 'rgba(0,0,0,0.25)'; g.beginPath(); g.arc(c, c, c * 0.62, 0, Math.PI * 2); g.fill();
   g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillStyle = '#ffffff';
-  g.font = `700 ${W * 0.11}px ${FONT}`; g.fillText('SEGUE/32', c, c * 0.42);
+  drawLogo(g, c, c * 0.42, W * 0.1);
   g.font = `600 ${W * 0.075}px ${FONT}`;
   let t = deck.title || 'NO RECORD'; while (g.measureText(t).width > W * 0.78 && t.length > 4) t = t.slice(0, -2);
   if (t !== (deck.title || 'NO RECORD')) t += '…';
@@ -1213,7 +1254,6 @@ buildStrip(deckB, 0.07, 1);
 const xfader = makeFader(rig, 0, 0.215, 'x', 0.12, { value: 0.5, color: 0xffffff, onChange: v => setCrossfader(v) });
 label(rig, -0.088, 0.219, 'A', { color: CSS_A, size: 0.016, weight: 700 });
 label(rig, 0.088, 0.219, 'B', { color: CSS_B, size: 0.016, weight: 700 });
-label(rig, 0, 0.262, 'SEGUE/32', { color: '#6f7690', size: 0.013, weight: 700 });
 
 // VU meters
 const vu = { A: [], B: [] };
@@ -1323,6 +1363,9 @@ surfaceDraws.push(buildSurface(rig, TABLE_W, TABLE_D, 0, 0, (g, X, Z, ppm) => {
   panel(-0.615, -0.2, 'rgba(25,211,255,0.35)');
   panel(-0.19, 0.19, 'rgba(255,255,255,0.14)');
   panel(0.2, 0.615, 'rgba(255,61,154,0.35)');
+  drawLogo(g, X(0), Z(0.262), 0.015 * ppm);
+  drawLogo(g, X(-0.49), Z(0.245), 0.017 * ppm);
+  drawLogo(g, X(0.49), Z(0.245), 0.017 * ppm);
 }));
 surfaceDraws.push(buildSurface(wing, 0.28, 0.30, 0, 0.06, (g, X, Z, ppm) => {
   roundRect(g, X(-0.135), Z(-0.085), 0.27 * ppm, 0.29 * ppm, 0.012 * ppm);
@@ -1551,7 +1594,7 @@ async function loadEntry(entry, deck) {
     await nextFrame();
     if (!entry.meta || !entry.meta.bpm) entry.meta = analyzeTrack(buf);
     else if (!entry.meta.peaks) entry.meta = { ...entry.meta, peaks: computePeaks(buf, 150), peakRate: 150 };
-    if (entry.id && !entry.demo) idbPut({ id: entry.id, name: entry.name, blob: entry.file, bpm: entry.meta.bpm, firstBeat: entry.meta.firstBeat });
+    if (entry.id && !entry.demo) idbPut({ id: entry.id, name: entry.name, blob: entry.file, crate: entry.crate || null, bpm: entry.meta.bpm, firstBeat: entry.meta.firstBeat });
     deck.loading = false;
     deck.load(buf, entry.name, entry.meta);
     deck.entry = entry;
@@ -1570,6 +1613,7 @@ async function loadEntry(entry, deck) {
 function addFiles(files) {
   const before = library.length;
   for (const f of files) {
+    if (/\.zip$/i.test(f.name) || f.type === 'application/zip') { importProject(f, f.name); continue; }
     if (!/^audio\//.test(f.type) && !/\.(mp3|wav|m4a|aac|flac|ogg|aif|aiff)$/i.test(f.name)) continue;
     const e = { id: 't' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7), name: f.name.replace(/\.[^.]+$/, ''), file: f };
     library.push(e); idbPut({ id: e.id, name: e.name, blob: f });
@@ -1584,7 +1628,9 @@ function renderLibUI() {
   libUl.innerHTML = '';
   library.forEach((e, i) => {
     const li = document.createElement('li');
-    const nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = e.name; li.appendChild(nm);
+    const nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = e.name;
+    if (e.crate) { const cr = document.createElement('small'); cr.textContent = '  ' + e.crate; cr.style.color = 'var(--dim)'; nm.appendChild(cr); }
+    li.appendChild(nm);
     const bpm = document.createElement('span'); bpm.className = 'bpm'; bpm.textContent = e.meta ? e.meta.bpm.toFixed(1) : ''; li.appendChild(bpm);
     const ba = document.createElement('button'); ba.className = 'la'; ba.textContent = deckA.entry === e ? '● A' : 'A';
     ba.onclick = () => { libSel = i; loadEntry(e, deckA); };
@@ -1629,6 +1675,66 @@ function idbPut(rec) { if (!rec.blob) return; idbTx('readwrite', st => st.put({ 
 function idbDel(id) { idbTx('readwrite', st => st.delete(id)); }
 async function idbAll() { const r = await idbTx('readonly', st => st.getAll()); return Array.isArray(r) ? r.sort((a, b) => (a.added || 0) - (b.added || 0)) : []; }
 
+/* ---------- import a mix exported from desktop SEGUE/32 (.segue32.zip) ---------- */
+function unzipStore(buf) {
+  const u = new Uint8Array(buf), v = new DataView(buf); let e = -1;
+  for (let i = u.length - 22; i >= Math.max(0, u.length - 65557); i--) { if (v.getUint32(i, true) === 0x06054b50) { e = i; break; } }
+  if (e < 0) throw new Error("That file isn't a SEGUE/32 project.");
+  const n = v.getUint16(e + 10, true), td = new TextDecoder(), out = {}; let p = v.getUint32(e + 16, true);
+  for (let k = 0; k < n; k++) {
+    if (v.getUint32(p, true) !== 0x02014b50) throw new Error('The project file is damaged.');
+    const method = v.getUint16(p + 10, true), size = v.getUint32(p + 20, true), nl = v.getUint16(p + 28, true), xl = v.getUint16(p + 30, true), cl = v.getUint16(p + 32, true), lo = v.getUint32(p + 42, true);
+    const name = td.decode(u.subarray(p + 46, p + 46 + nl));
+    if (method !== 0) throw new Error('This zip was compressed by another app, which this importer can\'t read. Use the file exactly as SEGUE/32 exported it, or unzip it and add the audio with + Add tracks.');
+    const ds = lo + 30 + v.getUint16(lo + 26, true) + v.getUint16(lo + 28, true);
+    out[name] = u.subarray(ds, ds + size); p += 46 + nl + xl + cl;
+  }
+  return out;
+}
+async function importProject(fileOrBlob, label) {
+  const msg = document.getElementById('linkMsg');
+  try {
+    msg.textContent = `Reading ${label || 'project'}…`;
+    const entries = unzipStore(await fileOrBlob.arrayBuffer());
+    const raw = entries['mix.json'];
+    if (!raw) {
+      // Not a project: a zip of audio files (e.g. a WAV/MP3 exported from desktop SEGUE/32). Add each one as a track.
+      const audio = Object.keys(entries).filter(n => /\.(wav|mp3|m4a|aac|flac|ogg|aiff?)$/i.test(n) && !/(^|\/)\./.test(n));
+      if (!audio.length) throw new Error("That zip has no audio files or SEGUE/32 project inside.");
+      const first = library.length;
+      for (const n of audio) {
+        const base = n.split('/').pop(), type = /\.mp3$/i.test(n) ? 'audio/mpeg' : /\.wav$/i.test(n) ? 'audio/wav' : '';
+        const e = { id: 't' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7), name: base.replace(/\.[^.]+$/, ''), file: new Blob([entries[n]], { type }) };
+        library.push(e); idbPut({ id: e.id, name: e.name, blob: e.file });
+      }
+      libSel = first; libDirty = true; renderLibUI();
+      msg.textContent = `Added ${audio.length} audio file${audio.length === 1 ? '' : 's'} from the zip.`;
+      return;
+    }
+    const doc = JSON.parse(new TextDecoder().decode(raw));
+    const crate = doc.name || 'Imported mix';
+    let added = 0, skipped = 0; const first = library.length;
+    (doc.tracks || []).forEach((t, i) => {
+      const a = doc.audio && t.audioId && doc.audio[t.audioId], data = a && entries[a.path];
+      if (!data) { skipped++; return; }
+      const e = {
+        id: 't' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7) + i,
+        name: `${String(i + 1).padStart(2, '0')} · ${t.name}`, crate,
+        file: new Blob([data], { type: a.type || '' }),
+        meta: t.bpm ? { bpm: t.bpm, firstBeat: t.firstBeat || 0 } : null,     // reuse the desktop app's beat grid
+      };
+      library.push(e); added++;
+      idbPut({ id: e.id, name: e.name, blob: e.file, crate, bpm: e.meta && e.meta.bpm, firstBeat: e.meta && e.meta.firstBeat });
+    });
+    if (added) libSel = first;
+    libDirty = true; renderLibUI();
+    msg.textContent = added
+      ? `Imported “${crate}”: ${added} track${added === 1 ? '' : 's'} in mix order${skipped ? ` (${skipped} demo track${skipped === 1 ? '' : 's'} skipped)` : ''}.`
+      : `“${crate}” has no audio files inside, so there was nothing to import.`;
+  } catch (err) { console.warn(err); msg.textContent = err.message || "Couldn't import that project."; }
+}
+document.getElementById('projIn').addEventListener('change', e => { const f = e.target.files[0]; e.target.value = ''; if (f) importProject(f, f.name); });
+
 /* ---------- add from a cloud link ---------- */
 const linkMsg = document.getElementById('linkMsg');
 function directLink(raw) {
@@ -1658,6 +1764,8 @@ async function addFromLink() {
     const r = await fetch(d.url, { mode: 'cors' });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const blob = await r.blob();
+    const head = new Uint8Array(await blob.slice(0, 2).arrayBuffer());
+    if (head[0] === 0x50 && head[1] === 0x4b) { await importProject(blob, d.host + ' link'); document.getElementById('linkIn').value = ''; return; }
     if (blob.size < 20000) throw new Error('not an audio file');
     const name = nameFromUrl(raw, nameFromUrl(d.url, `${d.host} track ${library.length + 1}`));
     const e = { id: 't' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7), name, file: blob };
@@ -2275,13 +2383,13 @@ renderer.setAnimationLoop(() => {
    ========================================================= */
 for (const c of controls) if (c.type === 'knob' || c.type === 'fader') c.set(c.value, true);
 setCrossfader(0.5);
-document.fonts && document.fonts.load(`600 20px ${FONT}`).then(() => { surfaceDraws.forEach(f => f()); decks.forEach(d => d.onLoad && d.onLoad()); libDirty = true; }).catch(() => {});
+document.fonts && document.fonts.load(`600 20px ${FONT}`).then(() => { surfaceDraws.forEach(f => f()); decks.forEach(d => d.onLoad && d.onLoad()); window.__redrawFront && window.__redrawFront(); libDirty = true; }).catch(() => {});
 
 applyPalette(); renderLegend(); visSel.value = visMode; sceneSel.value = sceneEvery; applyEnv();
 idbAll().then(recs => {
   for (const r of recs) {
     if (!r.blob || library.some(e => e.id === r.id)) continue;
-    library.push({ id: r.id, name: r.name, file: r.blob, meta: r.bpm ? { bpm: r.bpm, firstBeat: r.firstBeat || 0 } : null });
+    library.push({ id: r.id, name: r.name, file: r.blob, crate: r.crate || null, meta: r.bpm ? { bpm: r.bpm, firstBeat: r.firstBeat || 0 } : null });
   }
   libDirty = true; renderLibUI();
 });
@@ -2306,7 +2414,7 @@ idbAll().then(recs => {
 })();
 
 // exposed for testing
-window.__segue = { setDeckStyle, setXfCurve, jogs, get workletOK() { return workletOK; }, nextScene, vscene, wall, applyEnv, get venueOn() { return venueOn; }, deckA, deckB, detectBPM, synthDemo, controls, setCrossfader, camera, xfader, mixerKnobs, THREE, setWaveStyle, setVisMode, library, directLink, feat };
+window.__segue = { importProject, setDeckStyle, setXfCurve, jogs, get workletOK() { return workletOK; }, nextScene, vscene, wall, applyEnv, get venueOn() { return venueOn; }, deckA, deckB, detectBPM, synthDemo, controls, setCrossfader, camera, xfader, mixerKnobs, THREE, setWaveStyle, setVisMode, library, directLink, feat };
 </script>
 </body>
 </html>
