@@ -82,6 +82,10 @@
       <label class="field">Visuals<select id="visSel"><option value="full">Full</option><option value="chill">Chill</option><option value="off">Off</option></select></label>
     </div>
     <div class="row">
+      <label class="field">Deck style<select id="styleSel"><option value="tt">Turntable</option><option value="cdj">CDJ</option></select></label>
+      <label class="field">Crossfader<select id="xfSel"><option value="smooth">Smooth</option><option value="sharp">Sharp cut (scratch)</option></select></label>
+    </div>
+    <div class="row">
       <label class="field">Change scene<select id="sceneSel">
         <option value="30">Every 30 sec</option><option value="45">Every 45 sec</option><option value="60">Every 1 min</option>
         <option value="120">Every 2 min</option><option value="300">Every 5 min</option><option value="2700">Every 45 min</option><option value="never">Never</option>
@@ -100,6 +104,8 @@
         <li><b>SYNC</b> matches tempo and beat phase to the other deck. Moving the tempo fader turns sync off.</li>
         <li>Add your MP3 or WAV files here <i>before</i> entering VR. Then pick them in the library panel on the left of the booth.</li>
         <li><b>VENUE</b> switches between passthrough and a virtual club. <b>RECENTER</b> moves the booth in front of you.</li>
+        <li><b>Scratching:</b> in Turntable style, put your fingertip (or a pinch) on the record and move it back and forth. Let go and it plays on. In CDJ style, the top plate scratches and the outer ring bends the pitch. <b>XF CUT</b> gives the crossfader a sharp cut for scratch tricks.</li>
+        <li><b>TT / CDJ</b> on the mixer switches the deck style.</li>
         <li><b>NEXT SCENE</b> changes the LED wall and laser pattern now. Scenes also change on their own on the timer you pick, at the start of a musical phrase.</li>
         <li><b>WAVE</b> cycles the waveform colors, which also recolor the visuals. <b>VISUALS</b> cycles Full, Chill and Off.</li>
         <li>Tracks you add stay in this browser's library, so you only add them once per headset.</li>
@@ -143,6 +149,87 @@ mixBus.connect(limiter); limiter.connect(masterGain); masterGain.connect(masterA
 
 const eqDb = v => v < 0.5 ? (v / 0.5 - 1) * 26 : (v - 0.5) / 0.5 * 6;
 
+let deckStyle = (() => { try { return localStorage.getItem('segue32vr.deckStyle') === 'cdj' ? 'cdj' : 'tt'; } catch (e) { return 'tt'; } })();
+let xfCurve = (() => { try { return localStorage.getItem('segue32vr.xfCurve') === 'sharp' ? 'sharp' : 'smooth'; } catch (e) { return 'smooth'; } })();
+
+/* ---------- deck playback engine (AudioWorklet): plays at any speed, forwards or backwards ---------- */
+const REV_SEC = 1 / 0.5556;   // one platter revolution at 33 1/3 rpm = 1.8 s of audio
+const WORKLET_SRC = `
+class DeckProc extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.L = null; this.R = null; this.len = 0; this.sr = 44100; this.ratio = 1;
+    this.pos = 0; this.v = 0; this.rate = 1; this.playing = false; this.loop = null;
+    this.scratch = false; this.target = 0; this.tvel = 0; this.amp = 0; this.motorK = 0.02;
+    this.seq = 0; this.blocks = 0;
+    this.kp = 1 / (0.012 * sampleRate);
+    this.port.onmessage = (e) => {
+      const m = e.data;
+      if (m.seq !== undefined) this.seq = m.seq;
+      switch (m.t) {
+        case 'load': this.L = m.L; this.R = m.R || m.L; this.len = this.L.length; this.sr = m.sr; this.ratio = m.sr / sampleRate;
+                     this.pos = 0; this.v = 0; this.playing = false; this.loop = null; this.scratch = false; break;
+        case 'play': this.playing = true; if (m.pos !== undefined) this.pos = m.pos * this.sr; if (m.instant) this.v = this.rate * this.ratio; break;
+        case 'pause': this.playing = false; if (m.instant) this.v = 0; break;
+        case 'seek': this.pos = m.pos * this.sr; break;
+        case 'rate': this.rate = m.r; break;
+        case 'motor': this.motorK = m.k; break;
+        case 'loop': this.loop = m.loop ? [m.loop[0] * this.sr, m.loop[1] * this.sr] : null; break;
+        case 'scratch':
+          this.scratch = m.on; this.pos = m.pos * this.sr;
+          if (m.on) { this.target = this.pos; this.tvel = 0; }
+          break;
+        case 'target': this.target = m.pos * this.sr; this.tvel = m.vel * this.ratio; break;
+      }
+    };
+  }
+  process(inputs, outputs) {
+    const out = outputs[0], oL = out[0], oR = out[1] || out[0], n = oL.length;
+    const L = this.L, R = this.R, len = this.len;
+    if (!L || len < 4) { oL.fill(0); if (oR !== oL) oR.fill(0); return true; }
+    let pos = this.pos, v = this.v, amp = this.amp, ended = false;
+    const lim = 12 * this.ratio;
+    for (let i = 0; i < n; i++) {
+      if (this.scratch) {
+        this.target += this.tvel;
+        let want = this.tvel + (this.target - pos) * this.kp;
+        want = want > lim ? lim : want < -lim ? -lim : want;
+        v += (want - v) * 0.02;
+      } else {
+        const tv = this.playing ? this.rate * this.ratio : 0;
+        v += (tv - v) * this.motorK;
+      }
+      pos += v;
+      if (!this.scratch && this.loop && v > 0 && pos >= this.loop[1]) pos -= (this.loop[1] - this.loop[0]);
+      if (pos < 0) { pos = 0; if (v < 0) v = 0; }
+      if (pos >= len - 2) { pos = len - 2; if (v > 0) v = 0; if (this.playing && !this.scratch) { this.playing = false; ended = true; } }
+      const av = v < 0 ? -v : v;
+      const at = av > 0.15 * this.ratio ? 1 : av / (0.15 * this.ratio);
+      amp += (at - amp) * 0.01;
+      const i0 = pos | 0, f = pos - i0;
+      const l = L[i0] + (L[i0 + 1] - L[i0]) * f;
+      const r = R[i0] + (R[i0 + 1] - R[i0]) * f;
+      oL[i] = l * amp; if (oR !== oL) oR[i] = r * amp;
+    }
+    this.pos = pos; this.v = v; this.amp = amp;
+    if (ended) this.port.postMessage({ t: 'ended', seq: this.seq });
+    if (++this.blocks % 4 === 0 || ended) this.port.postMessage({ t: 'pos', pos: pos / this.sr, vel: v / this.ratio, time: currentTime + n / sampleRate, seq: this.seq });
+    return true;
+  }
+}
+registerProcessor('deck-proc', DeckProc);
+`;
+let workletOK = false;
+const workletReady = (async () => {
+  try {
+    if (!actx.audioWorklet) throw new Error('no AudioWorklet');
+    try { await actx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET_SRC], { type: 'application/javascript' }))); }
+    catch (e1) { await actx.audioWorklet.addModule('data:application/javascript;base64,' + btoa(unescape(encodeURIComponent(WORKLET_SRC)))); }
+    workletOK = true;
+    decks.forEach(d => d._attach());
+  } catch (e) { console.warn('AudioWorklet unavailable; scratching disabled', e); }
+})();
+
 class Deck {
   constructor(id, color, css) {
     this.id = id; this.color = color; this.css = css;
@@ -151,6 +238,7 @@ class Deck {
     this.tempo = 0; this.range = 0.08; this.nudge = 1; this.nudgeTarget = 1;
     this.synced = false; this.cue = 0; this.loop = null; this.loading = false;
     this.peaks = null; this.overview = null; this.level = 0; this._appliedRate = 1;
+    this.node = null; this.seq = 0; this.rep = { pos: 0, time: 0, vel: 0 }; this.scratching = false; this.scratchPos = 0; this.pll = 1;
     const c = actx;
     this.trim = c.createGain();
     this.low = c.createBiquadFilter(); this.low.type = 'lowshelf'; this.low.frequency.value = 220;
@@ -182,6 +270,7 @@ class Deck {
 
   load(buffer, title, meta) {
     this.stop();
+    if (this.scratching) this.scratching = false;
     this.buffer = buffer; this.title = title;
     this.bpm = meta.bpm; this.firstBeat = meta.firstBeat;
     this.peaks = meta.peaks; this.peakRate = meta.peakRate;
@@ -189,7 +278,49 @@ class Deck {
     refreshDeckColors(this);
     this.pos = 0; this.cue = Math.max(0, meta.firstBeat); this.pos = this.cue;
     this.loop = null; this.synced = false; this.nudge = 1; this.nudgeTarget = 1;
+    if (this.node) { this._sendLoad(); this._cmd({ t: 'seek', pos: this.pos }); this._cmd({ t: 'loop', loop: null }, false); }
+    if (this.onLoad) this.onLoad();
   }
+  /* ---- worklet engine (scratchable) ---- */
+  _attach() {
+    if (this.node || !workletOK) return;
+    try {
+      this.node = new AudioWorkletNode(actx, 'deck-proc', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2] });
+    } catch (e) { console.warn('worklet node failed', e); this.node = null; return; }
+    this.seq = 0; this.rep = { pos: this.pos, time: actx.currentTime, vel: 0 };
+    this.node.port.onmessage = e => this._onMsg(e.data);
+    this.node.connect(this.trim);
+    this._cmd({ t: 'motor', k: deckStyle === 'tt' ? 0.0009 : 0.02 }, false);
+    if (this.buffer) {
+      const wasPlaying = this.playing;
+      if (this.src) { this._advance(); this._stopSrc(); }
+      this._sendLoad(); this._cmd({ t: 'seek', pos: this.pos });
+      if (this.loop) this._cmd({ t: 'loop', loop: [this.loop.start, this.loop.end] }, false);
+      if (wasPlaying) { this._cmd({ t: 'rate', r: this.rate * this.nudge }, false); this._cmd({ t: 'play', pos: this.pos, instant: true }); }
+    }
+  }
+  _sendLoad() {
+    const b = this.buffer;
+    const L = new Float32Array(b.getChannelData(0));
+    const msg = { t: 'load', L, sr: b.sampleRate };
+    const tr = [L.buffer];
+    if (b.numberOfChannels > 1) { msg.R = new Float32Array(b.getChannelData(1)); tr.push(msg.R.buffer); }
+    this.node.port.postMessage(msg, tr);
+  }
+  _cmd(m, bump = true) {
+    if (!this.node) return;
+    if (bump) {
+      m.seq = ++this.seq;
+      this.rep = { pos: this.pos, time: actx.currentTime, vel: this.playing && !this.scratching ? this.rate * this.nudge : 0 };
+    }
+    this.node.port.postMessage(m);
+  }
+  _onMsg(m) {
+    if (m.seq !== this.seq) return;
+    if (m.t === 'pos') { this.rep = { pos: m.pos, time: m.time, vel: m.vel }; if (!this.playing && !this.scratching) this.pos = m.pos; }
+    else if (m.t === 'ended') { this.playing = false; this.pos = this.duration; this.rep = { pos: this.pos, time: actx.currentTime, vel: 0 }; }
+  }
+  /* ---- legacy engine (AudioBufferSourceNode), used only if AudioWorklet is unavailable ---- */
   _startSrc() {
     const s = actx.createBufferSource();
     s.buffer = this.buffer;
@@ -209,37 +340,66 @@ class Deck {
     try { this.src.disconnect(); } catch (e) {}
     this.src = null;
   }
+  /* ---- transport ---- */
   play() {
     if (!this.buffer || this.playing || this.loading) return;
     resumeAudio();
     if (this.pos >= this.duration - 0.05) this.pos = 0;
     if (this.synced) this.matchTempo();
-    this.playing = true; this._startSrc();
+    this.playing = true;
+    if (this.node) { this._appliedRate = this.rate * this.nudge; this._cmd({ t: 'rate', r: this._appliedRate }, false); this._cmd({ t: 'play', pos: this.pos, instant: this.synced }); }
+    else this._startSrc();
     if (this.synced) this.alignPhase();
   }
-  pause() { if (!this.playing) return; this.update(); this._stopSrc(); this.playing = false; }
-  stop() { this._stopSrc(); this.playing = false; }
+  pause() {
+    if (!this.playing) return;
+    this._advance();
+    this.playing = false;
+    if (this.node) this._cmd({ t: 'pause' }); else this._stopSrc();
+  }
+  stop() {
+    this.playing = false;
+    if (this.node) this._cmd({ t: 'pause', instant: true }); else this._stopSrc();
+  }
   toggle() { this.playing ? this.pause() : this.play(); }
   seek(t) {
     if (!this.buffer) return;
     this.pos = clamp(t, 0, this.duration);
-    if (this.loop && (this.pos < this.loop.start - 1e-3 || this.pos >= this.loop.end)) this.loop = null;
-    if (this.playing) { this._stopSrc(); this._startSrc(); }
+    if (this.loop && (this.pos < this.loop.start - 1e-3 || this.pos >= this.loop.end)) this._setLoop(null);
+    if (this.node) this._cmd({ t: 'seek', pos: this.pos });
+    else if (this.playing) { this._stopSrc(); this._startSrc(); }
+  }
+  _setLoop(loop) {
+    this.loop = loop;
+    if (this.node) this._cmd({ t: 'loop', loop: loop ? [loop.start, loop.end] : null }, false);
+    else if (this.src) { if (loop) { this.src.loopStart = loop.start; this.src.loopEnd = loop.end; this.src.loop = true; } else this.src.loop = false; }
   }
   update() {
     // smooth nudge from the jog wheel
     this.nudge += (this.nudgeTarget - this.nudge) * 0.35;
     if (Math.abs(this.nudge - 1) < 1e-4 && this.nudgeTarget === 1) this.nudge = 1;
-    if (!this.playing || !this.src) return;
+    if (!this.buffer) return;
     this._advance();
     const now = actx.currentTime;
-    const r = this.rate * this.nudge;
-    if (Math.abs(r - this._appliedRate) > 1e-5) { this.src.playbackRate.value = r; this._appliedRate = r; }
+    const r = this.rate * this.nudge * this.pll;
+    if (Math.abs(r - this._appliedRate) > 1e-5) {
+      this._appliedRate = r;
+      if (this.node) { this.rep = { pos: this.pos, time: now, vel: this.playing && !this.scratching ? r : this.rep.vel }; this._cmd({ t: 'rate', r }, false); }
+      else if (this.src) this.src.playbackRate.value = r;
+    }
     const eb = this.effBpm || 120;
     const dly = clamp(0.75 * 60 / eb, 0.05, 1.9);
     if (Math.abs(this.delay.delayTime.value - dly) > 0.002) this.delay.delayTime.setTargetAtTime(dly, now, 0.05);
   }
   _advance() {
+    if (this.node) {
+      if (this.scratching) { this.pos = this.scratchPos; return; }
+      if (!this.playing && Math.abs(this.rep.vel) < 1e-4) return;
+      let p = this.rep.pos + (actx.currentTime - this.rep.time) * this.rep.vel;
+      if (this.loop && this.playing && p >= this.loop.end) { const L = this.loop.end - this.loop.start; p = this.loop.start + ((p - this.loop.start) % L); }
+      this.pos = clamp(p, 0, this.duration);
+      return;
+    }
     if (!this.playing || !this.src) return;
     const now = actx.currentTime;
     const dt = now - this._last; this._last = now;
@@ -265,22 +425,19 @@ class Deck {
   toggleLoop(beats) {
     if (!this.buffer || !this.bpm) return;
     this._advance();
-    if (this.loop && this.loop.beats === beats) { this.loop = null; if (this.src) this.src.loop = false; return; }
+    if (this.loop && this.loop.beats === beats) { this._setLoop(null); return; }
     const bl = this.beatLen;
     const n = Math.floor(this.beatPos() + 1e-3);
     const start = Math.max(0, this.firstBeat + n * bl);
     const end = Math.min(start + beats * bl, this.duration);
     if (end - start < 0.05) return;
-    this.loop = { start, end, beats };
-    if (this.src) { this.src.loopStart = start; this.src.loopEnd = end; this.src.loop = true; }
+    this._setLoop({ start, end, beats });
   }
   beatJump(beats) {
     if (!this.buffer) return;
     this._advance();
-    const wasLoop = this.loop;
-    this.loop = null; if (this.src) this.src.loop = false;
+    this._setLoop(null);
     this.seek(this.pos + beats * this.beatLen);
-    if (wasLoop) { /* jumping exits the loop on purpose */ }
   }
   syncPress() {
     const m = this.other();
@@ -311,6 +468,7 @@ class Deck {
     if (d > 0.5) d -= 1; if (d < -0.5) d += 1;
     if (Math.abs(d) > 0.004) this.seek(this.pos + d * this.beatLen);
   }
+  /* ---- jog: nudge (pitch bend) or seek when paused ---- */
   jog(dAngle, dt, grab) {
     if (!this.buffer) return;
     if (this.playing) {
@@ -318,10 +476,30 @@ class Deck {
       grab.vel = (grab.vel || 0) * 0.6 + vel * 0.4;
       this.nudgeTarget = 1 + clamp(grab.vel * 0.05, -0.3, 0.3);
     } else {
-      this.pos = clamp(this.pos + dAngle / (2 * Math.PI * 0.5556), 0, this.duration);
+      this.seek(this.pos + dAngle / (2 * Math.PI * REV_SEC));
     }
   }
   jogRelease() { this.nudgeTarget = 1; }
+  /* ---- vinyl scratching: the record follows your hand ---- */
+  get canScratch() { return !!(this.node && this.buffer); }
+  scratchStart() {
+    if (!this.canScratch) return false;
+    this._advance();
+    this.scratching = true; this.scratchPos = this.pos;
+    this._cmd({ t: 'scratch', on: true, pos: this.pos });
+    return true;
+  }
+  scratchMove(pos, vel) {
+    if (!this.scratching) return;
+    this.scratchPos = this.pos = clamp(pos, 0, this.duration);
+    this.node.port.postMessage({ t: 'target', pos: this.scratchPos, vel });
+  }
+  scratchEnd() {
+    if (!this.scratching) return;
+    this.scratching = false;
+    if (this.loop && (this.pos < this.loop.start || this.pos >= this.loop.end)) this._setLoop(null);
+    this._cmd({ t: 'scratch', on: false, pos: this.pos });
+  }
   setEq(band, v) { const f = band === 'low' ? this.low : band === 'mid' ? this.mid : this.high; f.gain.setTargetAtTime(eqDb(v), actx.currentTime, 0.015); }
   setTrim(v) { this.trim.gain.setTargetAtTime(Math.pow(v * 2, 1.5), actx.currentTime, 0.015); }
   setFader(v) { this.fader.gain.setTargetAtTime((v * v) / 0.81, actx.currentTime, 0.01); }
@@ -349,8 +527,13 @@ let xfValue = 0.5;
 function setCrossfader(x) {
   xfValue = x;
   const t = actx.currentTime;
-  deckA.xf.gain.setTargetAtTime(Math.min(1, Math.cos(x * Math.PI / 2) * Math.SQRT2), t, 0.008);
-  deckB.xf.gain.setTargetAtTime(Math.min(1, Math.sin(x * Math.PI / 2) * Math.SQRT2), t, 0.008);
+  if (xfCurve === 'sharp') {   // scratch curve: full volume until the very edge, then a fast cut
+    deckA.xf.gain.setTargetAtTime(clamp01((1 - x) / 0.04), t, 0.002);
+    deckB.xf.gain.setTargetAtTime(clamp01(x / 0.04), t, 0.002);
+  } else {
+    deckA.xf.gain.setTargetAtTime(Math.min(1, Math.cos(x * Math.PI / 2) * Math.SQRT2), t, 0.008);
+    deckB.xf.gain.setTargetAtTime(Math.min(1, Math.sin(x * Math.PI / 2) * Math.SQRT2), t, 0.008);
+  }
 }
 
 /* =========================================================
@@ -693,6 +876,7 @@ function label(parent, x, z, text, opts = {}) { surf(parent).labels.push({ x, z,
 
 function register(c) { controls.push(c); c.hit.userData.control = c; hitMeshes.push(c.hit); c.parent.add(c.group); return c; }
 
+const knobLeds = [];
 const knobGeo = new THREE.CylinderGeometry(0.0165, 0.0185, 0.018, 28);
 const knobCapGeo = new THREE.CylinderGeometry(0.0135, 0.0135, 0.002, 28);
 const indGeo = new THREE.BoxGeometry(0.0025, 0.0024, 0.011);
@@ -709,14 +893,14 @@ function makeKnob(parent, x, z, o) {
     detent: o.detent ?? true, onChange: o.onChange, capMat, hover: 0 };
   c.set = (v, fire = true) => {
     v = clamp01(v); if (c.detent && Math.abs(v - 0.5) < 0.025) v = 0.5;
-    c.value = v; rot.rotation.y = -(v - 0.5) * Math.PI * 1.5;
+    c.value = v; rot.rotation.y = -(v - 0.5) * Math.PI * 1.5; c.ledDirty = true;
     if (fire && c.onChange) c.onChange(v);
   };
   c.distance = l => Math.hypot(Math.max(0, Math.hypot(l.x - x, l.z - z) - c.radius), l.y - c.top * 0.7);
   c.drag = (gr, p) => { const d = (p.x - gr.start.x) + (gr.start.z - p.z) + (p.y - gr.start.y); c.set(gr.startValue + d / 0.13); };
   c.wheel = dy => c.set(c.value - dy * 0.0009);
   c.visual = () => { capMat.emissiveIntensity = c.hover * 0.35; };
-  surf(parent).arcs.push({ x, z, r: 0.0235, color: o.arcColor || '#5c6277' });
+  c.ledColor = new THREE.Color(o.color || 0xffffff); c.ledBase = knobLeds.length * 0; knobLeds.push(c); c.ledDirty = true;
   if (o.label) label(parent, o.labelX ?? x, o.labelZ ?? (z + 0.034), o.label, { color: o.labelColor });
   return register(c);
 }
@@ -761,46 +945,204 @@ function makeFader(parent, x, z, axis, length, o) {
   return register(c);
 }
 
-const jogGeo = new THREE.CylinderGeometry(0.088, 0.09, 0.016, 64);
-function makeJog(parent, x, z, deck) {
-  const g = new THREE.Group(); g.position.set(x, 0, z);
-  const base = new THREE.Mesh(new THREE.CylinderGeometry(0.096, 0.096, 0.006, 64), matDark); base.position.y = 0.003; g.add(base);
-  const platter = new THREE.Group(); g.add(platter);
-  const pm = new THREE.MeshStandardMaterial({ color: 0x1d1f28, roughness: 0.3, metalness: 0.7, emissive: new THREE.Color(deck.color), emissiveIntensity: 0 });
-  const disc = new THREE.Mesh(jogGeo, pm); disc.position.y = 0.011; platter.add(disc);
-  for (let i = 1; i <= 4; i++) {
-    const groove = new THREE.Mesh(new THREE.RingGeometry(0.03 + i * 0.012, 0.0306 + i * 0.012, 64), new THREE.MeshBasicMaterial({ color: 0x2b2e3a }));
-    groove.rotation.x = -Math.PI / 2; groove.position.y = 0.0192; platter.add(groove);
+/* ---------- shared textures for the decks ---------- */
+function makeCanvasTex(w, h, draw) {
+  const cv = document.createElement('canvas'); cv.width = w; cv.height = h;
+  draw(cv.getContext('2d'), w, h);
+  const t = new THREE.CanvasTexture(cv); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = 4; return t;
+}
+const grooveTex = makeCanvasTex(1024, 1024, (g, W) => {
+  const c = W / 2;
+  g.fillStyle = '#0a0a0c'; g.fillRect(0, 0, W, W);
+  for (let r = c * 0.36; r < c * 0.975; r += 1.6) {
+    const gap = Math.abs(((r - c * 0.36) / (c * 0.615)) * 5 % 1 - 0.5) > 0.485;   // track gaps
+    g.strokeStyle = gap ? 'rgba(255,255,255,0.10)' : `rgba(255,255,255,${0.018 + Math.random() * 0.035})`;
+    g.lineWidth = gap ? 2.5 : 1; g.beginPath(); g.arc(c, c, r, 0, Math.PI * 2); g.stroke();
   }
-  const marker = new THREE.Mesh(new THREE.BoxGeometry(0.006, 0.002, 0.03), new THREE.MeshBasicMaterial({ color: 0xffffff }));
-  marker.position.set(0, 0.0195, -0.068); platter.add(marker);
-  const center = new THREE.Mesh(new THREE.CylinderGeometry(0.022, 0.022, 0.004, 32), new THREE.MeshBasicMaterial({ color: deck.color }));
-  center.position.y = 0.0205; platter.add(center);
-  const ringMat = new THREE.MeshBasicMaterial({ color: deck.color, transparent: true, opacity: 0.8 });
-  const ring = new THREE.Mesh(new THREE.TorusGeometry(0.093, 0.0025, 8, 96), ringMat);
-  ring.rotation.x = Math.PI / 2; ring.position.y = 0.007; g.add(ring);
-  const hit = new THREE.Mesh(new THREE.CylinderGeometry(0.097, 0.097, 0.034, 32), hitMat); hit.position.y = 0.014; g.add(hit);
-  const c = { type: 'jog', parent, group: g, hit, x, z, top: 0.019, radius: 0.092, deck, platter, pm, ringMat, hover: 0, value: 0 };
+  g.strokeStyle = 'rgba(255,255,255,0.18)'; g.lineWidth = 3; g.beginPath(); g.arc(c, c, c * 0.985, 0, Math.PI * 2); g.stroke();
+});
+const sheenTex = makeCanvasTex(256, 256, (g, W) => {
+  const c = W / 2;
+  for (const a0 of [-0.6, Math.PI - 0.6]) {
+    const grd = g.createRadialGradient(c, c, c * 0.35, c, c, c);
+    grd.addColorStop(0, 'rgba(255,255,255,0)'); grd.addColorStop(0.55, 'rgba(255,255,255,0.55)'); grd.addColorStop(1, 'rgba(255,255,255,0)');
+    g.fillStyle = grd; g.beginPath(); g.moveTo(c, c); g.arc(c, c, c, a0, a0 + 0.5); g.closePath(); g.fill();
+  }
+});
+const silverMat = new THREE.MeshStandardMaterial({ color: 0xa9afba, roughness: 0.28, metalness: 0.92 });
+const blackGloss = new THREE.MeshStandardMaterial({ color: 0x0b0c10, roughness: 0.25, metalness: 0.4 });
+const rubberMat = new THREE.MeshStandardMaterial({ color: 0x1a1c22, roughness: 0.85, metalness: 0.05 });
+
+function drawRecordLabel(g, W, deck) {
+  const c = W / 2;
+  g.clearRect(0, 0, W, W);
+  const grd = g.createRadialGradient(c, c * 0.8, 4, c, c, c);
+  grd.addColorStop(0, deck.css); grd.addColorStop(1, '#101018');
+  g.fillStyle = grd; g.beginPath(); g.arc(c, c, c - 1, 0, Math.PI * 2); g.fill();
+  g.fillStyle = 'rgba(0,0,0,0.25)'; g.beginPath(); g.arc(c, c, c * 0.62, 0, Math.PI * 2); g.fill();
+  g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillStyle = '#ffffff';
+  g.font = `700 ${W * 0.11}px ${FONT}`; g.fillText('SEGUE/32', c, c * 0.42);
+  g.font = `600 ${W * 0.075}px ${FONT}`;
+  let t = deck.title || 'NO RECORD'; while (g.measureText(t).width > W * 0.78 && t.length > 4) t = t.slice(0, -2);
+  if (t !== (deck.title || 'NO RECORD')) t += '…';
+  g.fillText(t, c, c * 1.5);
+  g.font = `500 ${W * 0.06}px ${FONT}`; g.fillStyle = 'rgba(255,255,255,0.75)';
+  g.fillText(deck.bpm ? `${deck.bpm.toFixed(1)} BPM · 33⅓` : '33⅓ RPM', c, c * 1.72);
+  g.fillStyle = '#d9dce6'; g.beginPath(); g.arc(c, c, W * 0.03, 0, Math.PI * 2); g.fill();
+}
+
+function makeJog(parent, x, z, deck, side) {
+  const g = new THREE.Group(); g.position.set(x, 0, z);
+  const inner = -side;   // toward the mixer
+  /* --- turntable --- */
+  const tt = new THREE.Group(); g.add(tt);
+  const plinthRing = new THREE.Mesh(new THREE.CylinderGeometry(0.112, 0.112, 0.004, 72), blackGloss); plinthRing.position.y = 0.002; tt.add(plinthRing);
+  const spin = new THREE.Group(); tt.add(spin);
+  const platter = new THREE.Mesh(new THREE.CylinderGeometry(0.104, 0.104, 0.012, 96), silverMat); platter.position.y = 0.010; spin.add(platter);
+  const dots = new THREE.InstancedMesh(new THREE.BoxGeometry(0.0028, 0.001, 0.0028), new THREE.MeshStandardMaterial({ color: 0xd8dce6, metalness: 0.6, roughness: 0.3 }), 90);
+  const m4 = new THREE.Matrix4();
+  for (let i = 0; i < 90; i++) { const a = i / 90 * Math.PI * 2; m4.makeTranslation(Math.cos(a) * 0.1015, 0.0163, Math.sin(a) * 0.1015); dots.setMatrixAt(i, m4); }
+  spin.add(dots);
+  const recMat = new THREE.MeshStandardMaterial({ map: grooveTex, roughness: 0.32, metalness: 0.35 });
+  const record = new THREE.Mesh(new THREE.CylinderGeometry(0.098, 0.098, 0.0018, 96), [blackGloss, recMat, blackGloss]);
+  record.position.y = 0.0169; spin.add(record);
+  const labelCv = document.createElement('canvas'); labelCv.width = labelCv.height = 256;
+  const labelTex = new THREE.CanvasTexture(labelCv); labelTex.colorSpace = THREE.SRGBColorSpace;
+  const label = new THREE.Mesh(new THREE.CircleGeometry(0.034, 48), new THREE.MeshStandardMaterial({ map: labelTex, roughness: 0.6 }));
+  label.rotation.x = -Math.PI / 2; label.position.y = 0.0181; spin.add(label);
+  const spindle = new THREE.Mesh(new THREE.CylinderGeometry(0.0032, 0.0032, 0.012, 16), silverMat); spindle.position.y = 0.022; spin.add(spindle);
+  const sheen = new THREE.Mesh(new THREE.CircleGeometry(0.097, 64), new THREE.MeshBasicMaterial({ map: sheenTex, transparent: true, opacity: 0.22, blending: THREE.AdditiveBlending, depthWrite: false }));
+  sheen.rotation.x = -Math.PI / 2; sheen.position.y = 0.0185; tt.add(sheen);
+  // tonearm
+  const PIV = new THREE.Vector2(inner * 0.145, -0.055), ARM = 0.152;
+  const base = new THREE.Mesh(new THREE.CylinderGeometry(0.017, 0.019, 0.012, 32), blackGloss); base.position.set(PIV.x, 0.006, PIV.y); tt.add(base);
+  const post = new THREE.Mesh(new THREE.CylinderGeometry(0.006, 0.006, 0.026, 16), silverMat); post.position.set(PIV.x, 0.018, PIV.y); tt.add(post);
+  const arm = new THREE.Group(); arm.position.set(PIV.x, 0.029, PIV.y); tt.add(arm);
+  const tube = new THREE.Mesh(new THREE.CylinderGeometry(0.0024, 0.0024, ARM, 12), silverMat); tube.rotation.z = Math.PI / 2; tube.position.x = ARM / 2; arm.add(tube);
+  const cw = new THREE.Mesh(new THREE.CylinderGeometry(0.0085, 0.0085, 0.02, 20), blackGloss); cw.rotation.z = Math.PI / 2; cw.position.x = -0.022; arm.add(cw);
+  const shell = new THREE.Mesh(new THREE.BoxGeometry(0.024, 0.004, 0.013), new THREE.MeshStandardMaterial({ color: 0x15161c, roughness: 0.4, metalness: 0.5 }));
+  shell.position.set(ARM + 0.006, -0.006, 0); arm.add(shell);
+  const cart = new THREE.Mesh(new THREE.BoxGeometry(0.012, 0.006, 0.009), new THREE.MeshStandardMaterial({ color: deck.color, emissive: new THREE.Color(deck.color), emissiveIntensity: 0.35 }));
+  cart.position.set(ARM + 0.008, -0.010, 0); arm.add(cart);
+  let armAng = Math.PI / 2;
+  /* --- CDJ --- */
+  const cdj = new THREE.Group(); g.add(cdj);
+  const bezel = new THREE.Mesh(new THREE.TorusGeometry(0.093, 0.0045, 12, 96), silverMat); bezel.rotation.x = Math.PI / 2; bezel.position.y = 0.006; cdj.add(bezel);
+  const cdjSpin = new THREE.Group(); cdj.add(cdjSpin);
+  const body = new THREE.Mesh(new THREE.CylinderGeometry(0.089, 0.09, 0.015, 96), rubberMat); body.position.y = 0.0085; cdjSpin.add(body);
+  for (let i = 0; i < 36; i++) {   // knurled outer ring
+    const rib = new THREE.Mesh(new THREE.BoxGeometry(0.0016, 0.0012, 0.016), blackGloss);
+    const a = i / 36 * Math.PI * 2; rib.position.set(Math.cos(a) * 0.08, 0.0166, Math.sin(a) * 0.08); rib.rotation.y = -a + Math.PI / 2; cdjSpin.add(rib);
+  }
+  const dispCv = document.createElement('canvas'); dispCv.width = dispCv.height = 256;
+  const dispTexJ = new THREE.CanvasTexture(dispCv); dispTexJ.colorSpace = THREE.SRGBColorSpace;
+  const jogDisp = new THREE.Mesh(new THREE.CircleGeometry(0.068, 64), new THREE.MeshBasicMaterial({ map: dispTexJ, toneMapped: false }));
+  jogDisp.rotation.x = -Math.PI / 2; jogDisp.position.y = 0.0169; cdj.add(jogDisp);
+  const LEDN = 72;
+  const leds = new THREE.InstancedMesh(new THREE.BoxGeometry(0.0034, 0.0016, 0.0034), new THREE.MeshBasicMaterial({ color: 0xffffff, toneMapped: false }), LEDN);
+  for (let i = 0; i < LEDN; i++) { const a = i / LEDN * Math.PI * 2 - Math.PI / 2; m4.makeTranslation(Math.cos(a) * 0.1015, 0.0012, Math.sin(a) * 0.1015); leds.setMatrixAt(i, m4); leds.setColorAt(i, new THREE.Color(0x111111)); }
+  cdj.add(leds);
+  const hit = new THREE.Mesh(new THREE.CylinderGeometry(0.108, 0.108, 0.04, 32), hitMat); hit.position.y = 0.016; g.add(hit);
+  const c = { type: 'jog', parent, group: g, hit, x, z, top: 0.018, radius: 0.1, deck, hover: 0, value: 0 };
+  c.applyStyle = () => {
+    tt.visible = deckStyle === 'tt'; cdj.visible = deckStyle === 'cdj';
+    c.top = deckStyle === 'tt' ? 0.018 : 0.017; c.radius = deckStyle === 'tt' ? 0.1 : 0.092;
+  };
+  c.applyStyle();
   c.set = () => {};
   c.distance = l => Math.hypot(Math.max(0, Math.hypot(l.x - x, l.z - z) - c.radius), l.y - c.top);
+  // Turntable: anywhere on the record scratches. CDJ: the top plate scratches, the outer ring bends pitch.
+  c.grabStart = (gr, p) => {
+    const r = Math.hypot(p.x - x, p.z - z);
+    gr.scratch = deck.canScratch && (deckStyle === 'tt' || r < 0.07);
+    gr.lastAng = null; gr.sv = 0;
+    if (gr.scratch) { deck.scratchStart(); gr.recPos = deck.pos; }
+  };
   c.drag = (gr, p, dt) => {
     const dx = p.x - x, dz = p.z - z;
-    if (Math.hypot(dx, dz) < 0.018) { deck.jog(0, dt, gr); return; }
+    if (Math.hypot(dx, dz) < 0.016) { if (gr.scratch) deck.scratchMove(gr.recPos, 0); else deck.jog(0, dt, gr); return; }
     const ang = Math.atan2(dz, dx);
     if (gr.lastAng == null) { gr.lastAng = ang; return; }
     const d = wrapPi(ang - gr.lastAng); gr.lastAng = ang;
-    deck.jog(d, dt, gr);
+    if (gr.scratch) {
+      const ds = d * REV_SEC / (2 * Math.PI);
+      gr.recPos = clamp(gr.recPos + ds, 0, deck.duration);
+      gr.sv = gr.sv * 0.45 + (ds / Math.max(dt, 1 / 144)) * 0.55;
+      deck.scratchMove(gr.recPos, gr.sv);
+    } else deck.jog(d, dt, gr);
   };
-  c.release = () => deck.jogRelease();
+  c.release = (gr) => { if (gr && gr.scratch) deck.scratchEnd(); else deck.jogRelease(); };
+  const offC = new THREE.Color(0x15161c), dimC = new THREE.Color(deck.color).multiplyScalar(0.28), hiC = new THREE.Color(0xffffff), dkC = new THREE.Color(deck.color);
+  deck.onLoad = () => { drawRecordLabel(labelCv.getContext('2d'), 256, deck); labelTex.needsUpdate = true; };
+  deck.onLoad();
+  let lastDisp = 0;
   c.visual = (now) => {
-    platter.rotation.y = -deck.pos * 2 * Math.PI * 0.5556;
-    pm.emissiveIntensity = c.hover * 0.12 + (c.grabbed ? 0.18 : 0);
-    let beatGlow = 0.35;
-    if (deck.playing && deck.bpm) { const f = deck.beatPos() % 1; beatGlow = 0.35 + 0.65 * Math.pow(1 - (f < 0 ? f + 1 : f), 3); }
-    ringMat.opacity = deck.buffer ? beatGlow : 0.15;
+    const rot = -deck.pos * 2 * Math.PI / REV_SEC;
+    if (deckStyle === 'tt') {
+      spin.rotation.y = rot;
+      let target = Math.PI / 2;
+      if (deck.buffer && !deck.loading) {
+        const prog = clamp01(deck.pos / Math.max(1, deck.duration));
+        const r = 0.093 - prog * 0.052;
+        const w = new THREE.Vector2(-PIV.x, -PIV.y), dd = w.length(), beta = Math.atan2(w.y, w.x);
+        const phi = Math.acos(clamp((ARM * ARM + dd * dd - r * r) / (2 * ARM * dd), -1, 1));
+        target = beta + side * phi;
+      }
+      armAng += wrapPi(target - armAng) * 0.12;
+      arm.rotation.y = -armAng;
+      cart.material.emissiveIntensity = 0.25 + (c.grabbed ? 0.6 : 0) + c.hover * 0.3;
+    } else {
+      cdjSpin.rotation.y = rot;
+      const prog = deck.buffer ? deck.pos / Math.max(1, deck.duration) : 0;
+      const head = (((-rot / (2 * Math.PI)) % 1) + 1) % 1;
+      for (let i = 0; i < LEDN; i++) {
+        const f = i / LEDN;
+        let col = offC;
+        if (deck.buffer) col = f <= prog ? dimC : offC;
+        const dh = Math.abs(((f - head + 1.5) % 1) - 0.5);
+        if (deck.buffer && dh < 1.5 / LEDN) col = deck.scratching ? hiC : dkC;
+        leds.setColorAt(i, col);
+      }
+      leds.instanceColor.needsUpdate = true;
+      if (now - lastDisp > 33) { lastDisp = now; drawJogDisplay(dispCv, deck, c); dispTexJ.needsUpdate = true; }
+    }
   };
   jogs.push(c);
   return register(c);
+}
+function drawJogDisplay(cv, deck, c) {
+  const g = cv.getContext('2d'), W = cv.width, m = W / 2;
+  g.fillStyle = '#07080c'; g.fillRect(0, 0, W, W);
+  g.strokeStyle = '#1d2030'; g.lineWidth = 10; g.beginPath(); g.arc(m, m, m - 14, 0, Math.PI * 2); g.stroke();
+  if (deck.buffer) {
+    const prog = deck.pos / Math.max(1, deck.duration);
+    g.strokeStyle = deck.css; g.globalAlpha = 0.55; g.beginPath(); g.arc(m, m, m - 14, -Math.PI / 2, -Math.PI / 2 + prog * Math.PI * 2); g.stroke(); g.globalAlpha = 1;
+    const a = deck.pos * 2 * Math.PI / REV_SEC - Math.PI / 2;
+    g.strokeStyle = '#ffffff'; g.lineWidth = 9; g.lineCap = 'round';
+    g.beginPath(); g.moveTo(m + Math.cos(a) * (m - 40), m + Math.sin(a) * (m - 40)); g.lineTo(m + Math.cos(a) * (m - 20), m + Math.sin(a) * (m - 20)); g.stroke();
+    const ca = deck.cue * 2 * Math.PI / REV_SEC - Math.PI / 2;
+    g.fillStyle = '#ff9a1f'; g.beginPath(); g.arc(m + Math.cos(ca) * (m - 14), m + Math.sin(ca) * (m - 14), 7, 0, Math.PI * 2); g.fill();
+    g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.fillStyle = '#ffffff'; g.font = `700 46px ${FONT}`;
+    g.fillText('-' + fmtTime((deck.duration - deck.pos) / Math.max(0.01, deck.rate)), m, m - 6);
+    g.font = `700 22px ${FONT}`; g.fillStyle = deck.scratching ? '#ffffff' : deck.css;
+    g.fillText(deck.scratching ? 'SCRATCH' : deck.playing ? 'PLAY' : 'PAUSE', m, m + 36);
+  } else {
+    g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillStyle = '#5a6078'; g.font = `600 26px ${FONT}`; g.fillText('NO TRACK', m, m);
+  }
+}
+function setDeckStyle(st) {
+  deckStyle = st === 'cdj' ? 'cdj' : 'tt';
+  try { localStorage.setItem('segue32vr.deckStyle', deckStyle); } catch (e) {}
+  jogs.forEach(j => j.applyStyle());
+  decks.forEach(d => d._cmd({ t: 'motor', k: deckStyle === 'tt' ? 0.0009 : 0.02 }, false));
+  const sel = document.getElementById('styleSel'); if (sel) sel.value = deckStyle;
+}
+function setXfCurve(cv) {
+  xfCurve = cv === 'sharp' ? 'sharp' : 'smooth';
+  try { localStorage.setItem('segue32vr.xfCurve', xfCurve); } catch (e) {}
+  setCrossfader(xfValue);
+  const sel = document.getElementById('xfSel'); if (sel) sel.value = xfCurve;
 }
 
 function makeButton(parent, x, z, o) {
@@ -808,7 +1150,8 @@ function makeButton(parent, x, z, o) {
   const g = new THREE.Group(); g.position.set(x, 0, z);
   const mat = new THREE.MeshStandardMaterial({ color: 0x1b1d26, roughness: 0.5, metalness: 0.2, emissive: new THREE.Color(o.color || 0xffffff), emissiveIntensity: 0.1 });
   const top = new THREE.Group(); g.add(top);
-  const box = new THREE.Mesh(new THREE.BoxGeometry(w, 0.012, d), mat); box.position.y = 0.006; top.add(box);
+  const box = new THREE.Mesh(o.round ? new THREE.CylinderGeometry(w / 2, w / 2 + 0.001, 0.012, 40) : new THREE.BoxGeometry(w, 0.012, d), mat); box.position.y = 0.006; top.add(box);
+  if (o.round) { const rim = new THREE.Mesh(new THREE.TorusGeometry(w / 2 + 0.002, 0.0016, 8, 48), silverMat); rim.rotation.x = Math.PI / 2; rim.position.y = 0.001; g.add(rim); }
   const hit = new THREE.Mesh(new THREE.BoxGeometry(w + 0.012, 0.036, d + 0.012), hitMat); hit.position.y = 0.012; g.add(hit);
   const c = { type: 'button', parent, group: g, hit, x, z, w, d, top: 0.012, radius: Math.max(w, d) / 2, mat, hover: 0, pressT: -1e9, lit: o.lit || (() => 0.1), onPress: o.onPress };
   c.press = (st) => { c.pressT = performance.now(); resumeAudio(); haptic(st, 0.5, 25); c.onPress && c.onPress(); };
@@ -827,15 +1170,15 @@ function makeButton(parent, x, z, o) {
 /* ---------- build decks ---------- */
 const blink = (now, period = 700) => (Math.floor(now / period) % 2) ? 1 : 0.15;
 function buildDeck(deck, dx, side) {
-  makeJog(rig, dx, -0.005, deck);
+  makeJog(rig, dx, -0.005, deck, side);
   deck.tempoCtl = makeFader(rig, dx + side * 0.155, 0.0, 'z', 0.16, { value: 0.5, detent: true, invert: true, color: deck.color,
     onChange: v => { deck.tempo = (v - 0.5) * 2; deck.synced = false; } });
   label(rig, dx + side * 0.155, 0.115, 'TEMPO');
   label(rig, dx + side * 0.155 + 0.026, -0.08, '–', { size: 0.012 });
   label(rig, dx + side * 0.155 + 0.026, 0.085, '+', { size: 0.012 });
-  makeButton(rig, dx - 0.09, 0.168, { w: 0.056, d: 0.038, color: 0xff9a1f, label: 'CUE', onPress: () => deck.cuePress(),
+  makeButton(rig, dx - 0.092, 0.168, { w: 0.05, d: 0.05, round: true, color: 0xff9a1f, label: 'CUE', onPress: () => deck.cuePress(),
     lit: () => deck.buffer ? (deck.playing ? 0.15 : 0.9) : 0.05 });
-  makeButton(rig, dx - 0.024, 0.168, { w: 0.056, d: 0.038, color: 0x37ff8b, label: 'PLAY / PAUSE', onPress: () => deck.toggle(),
+  makeButton(rig, dx - 0.026, 0.168, { w: 0.05, d: 0.05, round: true, color: 0x37ff8b, label: 'PLAY / PAUSE', onPress: () => deck.toggle(),
     lit: (now) => deck.playing ? 1.0 : (deck.buffer ? blink(now) * 0.5 : 0.05) });
   makeButton(rig, dx + 0.06, 0.168, { w: 0.05, d: 0.034, color: deck.color, label: 'SYNC', onPress: () => deck.syncPress(),
     lit: () => deck.synced ? 1.0 : 0.1 });
@@ -883,6 +1226,39 @@ const vu = { A: [], B: [] };
     seg.position.set(x, 0.0015, -0.04 - i * 0.0145); rig.add(seg); vu[id].push(m);
   }
 });
+
+/* ---------- knob LED value rings ---------- */
+const LED_PER = 15;
+const knobLedMesh = new THREE.InstancedMesh(new THREE.BoxGeometry(0.0024, 0.0012, 0.0024), new THREE.MeshBasicMaterial({ color: 0xffffff, toneMapped: false }), knobLeds.length * LED_PER);
+{
+  const m4 = new THREE.Matrix4(), off = new THREE.Color(0x1c1e27);
+  knobLeds.forEach((k, ki) => {
+    for (let j = 0; j < LED_PER; j++) {
+      const a = (-0.75 + 1.5 * j / (LED_PER - 1)) * Math.PI;
+      m4.makeTranslation(k.x + Math.sin(a) * 0.0255, 0.0008, k.z - Math.cos(a) * 0.0255);
+      knobLedMesh.setMatrixAt(ki * LED_PER + j, m4); knobLedMesh.setColorAt(ki * LED_PER + j, off);
+    }
+  });
+  rig.add(knobLedMesh);
+}
+const _ledOff = new THREE.Color(0x1c1e27), _ledTmp = new THREE.Color();
+function updateKnobLeds() {
+  let any = false;
+  knobLeds.forEach((k, ki) => {
+    if (!k.ledDirty) return; k.ledDirty = false; any = true;
+    for (let j = 0; j < LED_PER; j++) {
+      const f = j / (LED_PER - 1);
+      const lit = k.detent ? (k.value >= 0.5 ? (f >= 0.5 - 1e-6 && f <= k.value + 0.02) : (f <= 0.5 + 1e-6 && f >= k.value - 0.02)) : (f <= k.value + 0.02 && k.value > 0.005);
+      const center = k.detent && Math.abs(f - 0.5) < 1e-6;
+      knobLedMesh.setColorAt(ki * LED_PER + j, lit ? (center ? _ledTmp.set(0xffffff) : k.ledColor) : _ledOff);
+    }
+  });
+  if (any) knobLedMesh.instanceColor.needsUpdate = true;
+}
+
+/* ---------- style + crossfader-curve buttons on the mixer ---------- */
+makeButton(rig, 0.15, 0.232, { w: 0.05, d: 0.026, color: 0xffffff, label: 'TT / CDJ', labelSize: 0.0105, onPress: () => setDeckStyle(deckStyle === 'tt' ? 'cdj' : 'tt'), lit: () => 0.35 });
+makeButton(rig, -0.15, 0.232, { w: 0.05, d: 0.026, color: 0xff3d3d, label: 'XF CUT', labelSize: 0.0105, onPress: () => setXfCurve(xfCurve === 'sharp' ? 'smooth' : 'sharp'), lit: () => xfCurve === 'sharp' ? 1 : 0.12 });
 
 /* ---------- library wing ---------- */
 const wing = new THREE.Group();
@@ -1292,6 +1668,9 @@ document.getElementById('dirIn').addEventListener('change', e => { addFiles(e.ta
 const sceneSel = document.getElementById('sceneSel');
 sceneSel.onchange = () => { sceneEvery = sceneSel.value; vscene.lastSwitch = performance.now(); try { localStorage.setItem('segue32vr.sceneEvery', sceneEvery); } catch (e) {} };
 document.getElementById('sceneBtn').onclick = () => nextScene();
+document.getElementById('styleSel').onchange = e => setDeckStyle(e.target.value);
+document.getElementById('xfSel').onchange = e => setXfCurve(e.target.value);
+document.getElementById('styleSel').value = deckStyle; document.getElementById('xfSel').value = xfCurve;
 const ui = document.getElementById('ui');
 document.getElementById('toggle').onclick = () => { ui.classList.toggle('collapsed'); document.getElementById('toggle').textContent = ui.classList.contains('collapsed') ? '+' : '–'; };
 const drop = document.getElementById('drop');
@@ -1439,11 +1818,12 @@ function startGrab(st, c, mode) {
   c.lastGrab = now;
   st.grab = { c, mode, start: p, startValue: c.value, lastAng: null, lastT: now, vel: 0 };
   c.grabbed = true;
+  if (c.grabStart) c.grabStart(st.grab, p);
   haptic(st, 0.35, 18);
 }
 function releaseGrab(st) {
   if (!st.grab) return;
-  const c = st.grab.c; c.grabbed = false; if (c.release) c.release();
+  const c = st.grab.c; c.grabbed = false; if (c.release) c.release(st.grab);
   st.grab = null;
 }
 const _pl = new THREE.Vector3();
@@ -1810,6 +2190,14 @@ renderer.setAnimationLoop(() => {
   for (const d of decks) d.update();
   for (const d of decks) {
     if (d.synced) { const m = d.other(); if (m.buffer && Math.abs(m.effBpm - (d._masterBpm || 0)) > 1e-3) d.matchTempo(); }
+    // keep synced decks phase-locked with a gentle speed correction (no audible jumps)
+    let pll = 1;
+    const m = d.other();
+    if (d.synced && d.playing && m.playing && !d.scratching && !m.scratching && d.nudgeTarget === 1 && d.bpm && m.bpm) {
+      let e = (m.beatPos() % 1) - (d.beatPos() % 1); e = ((e % 1) + 1.5) % 1 - 0.5;
+      pll = 1 + clamp(e * 0.6, -0.03, 0.03);
+    }
+    d.pll = pll;
     d.meter(dt);
   }
   masterAn.getFloatTimeDomainData(masterBuf);
@@ -1830,6 +2218,7 @@ renderer.setAnimationLoop(() => {
     c.hover += ((hovers.has(c) ? 1 : 0) - c.hover) * 0.3;
     c.visual && c.visual(now);
   }
+  updateKnobLeds();
   // VU meters
   for (const d of decks) { const segs = vu[d.id]; const n = Math.round(d.level * segs.length); segs.forEach((m, i) => m.emissiveIntensity = i < n ? 1.1 : 0.05); }
   // venue lights
@@ -1854,7 +2243,7 @@ renderer.setAnimationLoop(() => {
    ========================================================= */
 for (const c of controls) if (c.type === 'knob' || c.type === 'fader') c.set(c.value, true);
 setCrossfader(0.5);
-document.fonts && document.fonts.load(`600 20px ${FONT}`).then(() => { surfaceDraws.forEach(f => f()); libDirty = true; }).catch(() => {});
+document.fonts && document.fonts.load(`600 20px ${FONT}`).then(() => { surfaceDraws.forEach(f => f()); decks.forEach(d => d.onLoad && d.onLoad()); libDirty = true; }).catch(() => {});
 
 applyPalette(); renderLegend(); visSel.value = visMode; sceneSel.value = sceneEvery; applyEnv();
 idbAll().then(recs => {
@@ -1885,7 +2274,7 @@ idbAll().then(recs => {
 })();
 
 // exposed for testing
-window.__segue = { nextScene, vscene, wall, applyEnv, get venueOn() { return venueOn; }, deckA, deckB, detectBPM, synthDemo, controls, setCrossfader, camera, xfader, mixerKnobs, THREE, setWaveStyle, setVisMode, library, directLink, feat };
+window.__segue = { setDeckStyle, setXfCurve, jogs, get workletOK() { return workletOK; }, nextScene, vscene, wall, applyEnv, get venueOn() { return venueOn; }, deckA, deckB, detectBPM, synthDemo, controls, setCrossfader, camera, xfader, mixerKnobs, THREE, setWaveStyle, setVisMode, library, directLink, feat };
 </script>
 </body>
 </html>
