@@ -1333,12 +1333,25 @@ surfaceDraws.push(buildSurface(wing, 0.28, 0.30, 0, 0.06, (g, X, Z, ppm) => {
 const DISP_W = 1024, DISP_H = 400;
 const dispCanvas = document.createElement('canvas'); dispCanvas.width = DISP_W; dispCanvas.height = DISP_H;
 const dispTex = new THREE.CanvasTexture(dispCanvas); dispTex.colorSpace = THREE.SRGBColorSpace;
+// Each deck gets its own screen, the same width as the deck below it; the mixer gets a smaller center screen.
+const CTR_W = 512, CTR_H = 240;
+const ctrCanvas = document.createElement('canvas'); ctrCanvas.width = CTR_W; ctrCanvas.height = CTR_H;
+const ctrTex = new THREE.CanvasTexture(ctrCanvas); ctrTex.colorSpace = THREE.SRGBColorSpace;
+function makeScreen(tex, w, h, x, y, z, yaw, uv) {
+  const holder = new THREE.Group(); holder.rotation.order = 'YXZ';
+  holder.position.set(x, y, z); holder.rotation.set(-0.3, yaw, 0); rig.add(holder);
+  const frame = new THREE.Mesh(new THREE.BoxGeometry(w + 0.018, h + 0.018, 0.018), matBody); frame.position.z = -0.011; holder.add(frame);
+  const geo = new THREE.PlaneGeometry(w, h);
+  if (uv) { const a = geo.attributes.uv; for (let i = 0; i < a.count; i++) a.setXY(i, uv[0] + a.getX(i) * (uv[1] - uv[0]), uv[2] + a.getY(i) * (uv[3] - uv[2])); }
+  holder.add(new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ map: tex, toneMapped: false })));
+  const stand = new THREE.Mesh(new THREE.BoxGeometry(0.03, y, 0.016), matBody); stand.position.set(0, -h / 2 - y / 2 + 0.02, -0.025); holder.add(stand);
+}
 {
-  const holder = new THREE.Group(); holder.position.set(0, 0.235, -0.315); holder.rotation.x = -0.3; rig.add(holder);
-  const frame = new THREE.Mesh(new THREE.BoxGeometry(1.07, 0.44, 0.02), matBody); frame.position.z = -0.012; holder.add(frame);
-  const screen = new THREE.Mesh(new THREE.PlaneGeometry(1.04, 1.04 * DISP_H / DISP_W), new THREE.MeshBasicMaterial({ map: dispTex, toneMapped: false }));
-  holder.add(screen);
-  const stand = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.24, 0.02), matBody); stand.position.set(0, -0.17, -0.03); holder.add(stand);
+  const panelH = DISP_H - 56, v0 = 1 - panelH / DISP_H;                // deck panel area of the shared canvas
+  const DW = 0.415, DH = DW * panelH / 512;
+  makeScreen(dispTex, DW, DH, -0.4075, 0.215, -0.305, 0.12, [0, 0.5, v0, 1]);
+  makeScreen(dispTex, DW, DH, 0.4075, 0.215, -0.305, -0.12, [0.5, 1, v0, 1]);
+  makeScreen(ctrTex, 0.34, 0.34 * CTR_H / CTR_W, 0, 0.165, -0.3, 0, null);
 }
 const dctx = dispCanvas.getContext('2d');
 
@@ -1435,31 +1448,50 @@ function drawDeckPanel(deck, x0) {
 }
 
 let masterLevel = 0;
-function drawDisplay() {
-  const g = dctx;
-  g.fillStyle = '#05060a'; g.fillRect(0, 0, DISP_W, DISP_H);
-  drawDeckPanel(deckA, 0);
-  drawDeckPanel(deckB, 512);
-  // footer: phase meter + master level
-  const fy = DISP_H - 44;
-  g.font = `700 16px ${FONT}`; g.textBaseline = 'middle'; g.textAlign = 'left'; g.fillStyle = '#6f7690';
-  g.fillText('PHASE', 20, fy + 20);
-  const mx = 80, mw = 520;
-  g.fillStyle = '#0f1119'; g.fillRect(mx, fy + 10, mw, 20);
-  g.fillStyle = '#3a3e52'; g.fillRect(mx + mw / 2 - 1, fy + 6, 2, 28);
+function drawCenter() {
+  const g = ctrCanvas.getContext('2d'), W = CTR_W, H = CTR_H;
+  g.fillStyle = '#07080c'; g.fillRect(0, 0, W, H);
+  g.strokeStyle = 'rgba(255,255,255,0.14)'; g.lineWidth = 2; g.strokeRect(3, 3, W - 6, H - 6);
+  g.textBaseline = 'middle';
+  // tempos
+  g.font = `700 34px ${FONT}`;
+  g.textAlign = 'left'; g.fillStyle = CSS_A; g.fillText(deckA.bpm ? deckA.effBpm.toFixed(1) : '—', 18, 34);
+  g.textAlign = 'right'; g.fillStyle = CSS_B; g.fillText(deckB.bpm ? deckB.effBpm.toFixed(1) : '—', W - 18, 34);
+  g.textAlign = 'center'; g.font = `600 16px ${FONT}`; g.fillStyle = '#6f7690'; g.fillText('BPM', W / 2, 34);
+  // phase meter
+  const mx = 18, mw = W - 36, my = 78;
+  g.textAlign = 'left'; g.fillText('PHASE', mx, my - 6);
+  g.fillStyle = '#0f1119'; g.fillRect(mx, my + 6, mw, 30);
+  g.fillStyle = '#3a3e52'; g.fillRect(mx + mw / 2 - 1, my + 2, 2, 38);
+  let status = '', stCol = '#6f7690';
   if (deckA.playing && deckB.playing && deckA.bpm && deckB.bpm) {
     const pa = deckA.beatPos() % 1, pb = deckB.beatPos() % 1;
     let d = (pb < 0 ? pb + 1 : pb) - (pa < 0 ? pa + 1 : pa); if (d > 0.5) d -= 1; if (d < -0.5) d += 1;
     const ok = Math.abs(d) < 0.03 && Math.abs(deckA.effBpm - deckB.effBpm) < 0.15;
     g.fillStyle = ok ? '#37ff8b' : '#ffd34d';
-    g.fillRect(mx + mw / 2 + d * mw - 6, fy + 10, 12, 20);
-    g.fillStyle = ok ? '#37ff8b' : '#8a90a3'; g.fillText(ok ? 'LOCKED' : (d > 0 ? 'B AHEAD' : 'A AHEAD'), mx + mw + 14, fy + 20);
+    g.fillRect(mx + mw / 2 + d * mw - 7, my + 6, 14, 30);
+    status = ok ? 'LOCKED' : (d > 0 ? 'B AHEAD' : 'A AHEAD'); stCol = ok ? '#37ff8b' : '#ffd34d';
   }
-  g.fillStyle = '#6f7690'; g.textAlign = 'left'; g.fillText('MASTER', 760, fy + 20);
-  const lw = 180;
-  g.fillStyle = '#0f1119'; g.fillRect(826, fy + 10, lw, 20);
-  const grd = g.createLinearGradient(826, 0, 826 + lw, 0); grd.addColorStop(0, '#37ff8b'); grd.addColorStop(0.75, '#ffd34d'); grd.addColorStop(1, '#ff4040');
-  g.fillStyle = grd; g.fillRect(826, fy + 10, lw * masterLevel, 20);
+  g.textAlign = 'right'; g.fillStyle = stCol; g.font = `700 16px ${FONT}`; g.fillText(status, mx + mw, my - 6);
+  // master level
+  const ly = 150;
+  g.textAlign = 'left'; g.fillStyle = '#6f7690'; g.font = `600 16px ${FONT}`; g.fillText('MASTER', mx, ly - 6);
+  g.fillStyle = '#0f1119'; g.fillRect(mx, ly + 6, mw, 22);
+  const grd = g.createLinearGradient(mx, 0, mx + mw, 0); grd.addColorStop(0, '#37ff8b'); grd.addColorStop(0.75, '#ffd34d'); grd.addColorStop(1, '#ff4040');
+  g.fillStyle = grd; g.fillRect(mx, ly + 6, mw * masterLevel, 22);
+  // crossfader position + scene
+  g.fillStyle = '#6f7690'; g.font = `600 15px ${FONT}`;
+  g.fillText(`XF ${xfCurve === 'sharp' ? 'CUT' : 'SMOOTH'}  ·  ${deckStyle === 'tt' ? 'TURNTABLE' : 'CDJ'}`, mx, 208);
+  g.textAlign = 'right';
+  g.fillText(`SCENE: ${SCENES[vscene.fadeT >= 0 ? vscene.next : vscene.cur].toUpperCase()}`, mx + mw, 208);
+  ctrTex.needsUpdate = true;
+}
+function drawDisplay() {
+  const g = dctx;
+  g.fillStyle = '#05060a'; g.fillRect(0, 0, DISP_W, DISP_H);
+  drawDeckPanel(deckA, 0);
+  drawDeckPanel(deckB, 512);
+  drawCenter();
   dispTex.needsUpdate = true;
 }
 
