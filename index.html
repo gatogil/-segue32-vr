@@ -70,6 +70,7 @@
     <div id="xrMsg">Checking WebXR support…</div>
     <div class="row">
       <label class="file">+ Add tracks<input id="fileIn" type="file" accept="audio/*,.mp3,.wav,.m4a,.aac,.flac,.ogg" multiple></label>
+      <label class="file">+ Add folder<input id="dirIn" type="file" webkitdirectory multiple></label>
     </div>
     <div class="row" id="linkRow">
       <input id="linkIn" type="text" placeholder="Paste a Dropbox, OneDrive or MP3 link" autocomplete="off">
@@ -79,6 +80,13 @@
     <div class="row">
       <label class="field">Waveform<select id="waveSel"></select></label>
       <label class="field">Visuals<select id="visSel"><option value="full">Full</option><option value="chill">Chill</option><option value="off">Off</option></select></label>
+    </div>
+    <div class="row">
+      <label class="field">Change scene<select id="sceneSel">
+        <option value="30">Every 30 sec</option><option value="45">Every 45 sec</option><option value="60">Every 1 min</option>
+        <option value="120">Every 2 min</option><option value="300">Every 5 min</option><option value="2700">Every 45 min</option><option value="never">Never</option>
+      </select></label>
+      <button id="sceneBtn" style="align-self:flex-end">Next scene</button>
     </div>
     <div class="legend" id="legend"></div>
     <h2>Library <span style="text-transform:none;letter-spacing:0">· saved on this device</span></h2>
@@ -92,6 +100,7 @@
         <li><b>SYNC</b> matches tempo and beat phase to the other deck. Moving the tempo fader turns sync off.</li>
         <li>Add your MP3 or WAV files here <i>before</i> entering VR. Then pick them in the library panel on the left of the booth.</li>
         <li><b>VENUE</b> switches between passthrough and a virtual club. <b>RECENTER</b> moves the booth in front of you.</li>
+        <li><b>NEXT SCENE</b> changes the LED wall and laser pattern now. Scenes also change on their own on the timer you pick, at the start of a musical phrase.</li>
         <li><b>WAVE</b> cycles the waveform colors, which also recolor the visuals. <b>VISUALS</b> cycles Full, Chill and Off.</li>
         <li>Tracks you add stay in this browser's library, so you only add them once per headset.</li>
       </ul>
@@ -642,6 +651,9 @@ const floorU = { uTime: { value: 0 }, uLevel: { value: 0 }, uRipple: { value: 0 
       }`,
   }));
   floor.rotation.x = -Math.PI / 2; venue.add(floor);
+  // Opaque dome: in passthrough the background color is ignored, so this is what blocks out the room
+  const dome = new THREE.Mesh(new THREE.SphereGeometry(9, 32, 16), new THREE.MeshBasicMaterial({ color: 0x06070b, side: THREE.BackSide }));
+  dome.position.y = 0; venue.add(dome);
 }
 const venueBars = [];
 for (let i = 0; i < 16; i++) {
@@ -889,7 +901,8 @@ makeButton(wing, 0.0, 0.035, { w: 0.06, d: 0.032, color: 0xb07dff, label: 'VENUE
 makeButton(wing, 0.09, 0.035, { w: 0.06, d: 0.032, color: 0xffffff, label: 'RECENTER', onPress: () => { needsRecenter = true; xrFrames = 99; }, lit: () => 0.15 });
 makeButton(wing, -0.09, 0.11, { w: 0.06, d: 0.032, color: 0xff9a1a, label: 'WAVE', onPress: () => setWaveStyle(WAVE_ORDER[(WAVE_ORDER.indexOf(waveStyle) + 1) % WAVE_ORDER.length]), lit: () => 0.45 });
 makeButton(wing, 0.0, 0.11, { w: 0.06, d: 0.032, color: 0x3bff6a, label: 'VISUALS', onPress: () => setVisMode(VIS_ORDER[(VIS_ORDER.indexOf(visMode) + 1) % VIS_ORDER.length]), lit: () => visMode === 'off' ? 0.12 : visMode === 'chill' ? 0.45 : 1 });
-label(wing, 0.09, 0.115, 'LIBRARY', { color: '#6f7690', size: 0.013, weight: 700 });
+makeButton(wing, 0.09, 0.11, { w: 0.06, d: 0.032, color: 0x4a7dff, label: 'NEXT SCENE', labelSize: 0.0105, onPress: () => nextScene(), lit: () => vscene.fadeT >= 0 ? 1 : 0.3 });
+label(wing, 0, 0.19, 'LIBRARY', { color: '#6f7690', size: 0.013, weight: 700 });
 
 /* ---------- surfaces (printed labels) ---------- */
 function buildSurface(parent, w, d, cx = 0, cz = 0, decorate) {
@@ -1112,7 +1125,7 @@ function drawLibrary() {
   g.font = `500 16px ${FONT}`; g.fillStyle = '#5a6078'; g.textAlign = 'left';
   g.fillText('UP / DOWN to choose · LOAD A or LOAD B', 20, 470);
   g.fillStyle = '#8a90a3';
-  g.fillText(`WAVE: ${WAVES[waveStyle].name}   ·   VISUALS: ${visMode.toUpperCase()}`, 20, 496);
+  g.fillText(`WAVE: ${WAVES[waveStyle].name}  ·  VISUALS: ${visMode.toUpperCase()}  ·  ${SCENES[vscene.fadeT >= 0 ? vscene.next : vscene.cur].toUpperCase()}`, 20, 496);
   libTex.needsUpdate = true; libDirty = false;
 }
 
@@ -1275,6 +1288,10 @@ function setVisMode(m) {
   visSel.value = m; libDirty = true; applyEnv();
 }
 document.getElementById('fileIn').addEventListener('change', e => { addFiles(e.target.files); e.target.value = ''; });
+document.getElementById('dirIn').addEventListener('change', e => { addFiles(e.target.files); e.target.value = ''; });
+const sceneSel = document.getElementById('sceneSel');
+sceneSel.onchange = () => { sceneEvery = sceneSel.value; vscene.lastSwitch = performance.now(); try { localStorage.setItem('segue32vr.sceneEvery', sceneEvery); } catch (e) {} };
+document.getElementById('sceneBtn').onclick = () => nextScene();
 const ui = document.getElementById('ui');
 document.getElementById('toggle').onclick = () => { ui.classList.toggle('collapsed'); document.getElementById('toggle').textContent = ui.classList.contains('collapsed') ? '+' : '–'; };
 const drop = document.getElementById('drop');
@@ -1567,28 +1584,74 @@ const feat = { bass: 0, mid: 0, high: 0, beat: 0, lastBeat: null, rippleT: -1e9,
 const freqBuf = new Uint8Array(masterAn.frequencyBinCount);
 
 // LED wall behind the booth
-const wallU = { uTime: { value: 0 }, uBass: { value: 0 }, uMid: { value: 0 }, uHigh: { value: 0 }, uBeat: { value: 0 }, uInt: { value: 1 },
+const wallU = { uTime: { value: 0 }, uBass: { value: 0 }, uMid: { value: 0 }, uHigh: { value: 0 }, uBeat: { value: 0 }, uPhase: { value: 0 }, uInt: { value: 1 },
+  uFade: { value: 0 }, uSceneA: { value: 0 }, uSceneB: { value: 0 },
   uSpec: { value: feat.spec }, uC0: { value: PAL[0] }, uC1: { value: PAL[1] }, uC2: { value: PAL[2] }, uC3: { value: PAL[3] } };
 const wall = new THREE.Mesh(new THREE.CylinderGeometry(3.4, 3.4, 2.6, 72, 1, true, Math.PI - 0.95, 1.9), new THREE.ShaderMaterial({
   uniforms: wallU, side: THREE.BackSide,
   vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
   fragmentShader: `
-    uniform float uTime, uBass, uMid, uHigh, uBeat, uInt; uniform float uSpec[32];
+    uniform float uTime, uBass, uMid, uHigh, uBeat, uPhase, uInt, uFade; uniform float uSpec[32];
+    uniform int uSceneA, uSceneB;
     uniform vec3 uC0, uC1, uC2, uC3; varying vec2 vUv;
-    void main(){
-      vec2 uv = vec2(1.0 - vUv.x, vUv.y);
+    float spec(float sx) { return uSpec[int(clamp(sx * 32.0, 0.0, 31.0))]; }
+    vec3 bottomBars(vec2 uv, float scale) {
+      float sx = abs(uv.x - 0.5) * 2.0, h = spec(sx) * scale, cell = step(0.18, fract(sx * 32.0));
+      return mix(uC3, uC1, uv.y / max(scale, 0.01)) * step(uv.y, h) * cell * 0.95;
+    }
+    vec3 sTunnel(vec2 uv) {
       vec2 p = (uv - vec2(0.5, 0.6)) * vec2(3.0, 1.3);
       float r = length(p) + 0.001, a = atan(p.y, p.x), t = uTime;
       float tunnel = pow(0.5 + 0.5 * sin(9.0 / r - t * 2.2 - uBass * 5.0), 6.0) * smoothstep(0.03, 0.4, r);
       float rays = pow(abs(sin(a * 5.0 + t * 0.35 + uMid * 2.5)), 18.0) * smoothstep(0.1, 0.9, r);
       vec3 col = mix(uC0, uC1, 0.5 + 0.5 * sin(a * 2.0 + t * 0.4)) * tunnel * (0.3 + uBass * 1.8);
       col += uC2 * rays * (0.1 + uMid * 1.5);
-      float sx = abs(uv.x - 0.5) * 2.0;
-      int bi = int(clamp(sx * 32.0, 0.0, 31.0));
-      float h = uSpec[bi] * 0.42, cell = step(0.18, fract(sx * 32.0));
-      col += mix(uC3, uC1, uv.y / 0.42) * step(uv.y, h) * cell * 0.95;
-      col += mix(uC2, uC3, (1.0 - uv.y) * 4.0) * step(1.0 - h * 0.45, uv.y) * cell * 0.4;
-      col += uC0 * uBeat * 0.25 * (1.0 - clamp(r, 0.0, 1.0));
+      col += bottomBars(uv, 0.42);
+      float sx = abs(uv.x - 0.5) * 2.0, h = spec(sx);
+      col += mix(uC2, uC3, (1.0 - uv.y) * 4.0) * step(1.0 - h * 0.45, uv.y) * step(0.18, fract(sx * 32.0)) * 0.4;
+      return col + uC0 * uBeat * 0.25 * (1.0 - clamp(r, 0.0, 1.0));
+    }
+    vec3 sKaleido(vec2 uv) {
+      vec2 p = (uv - vec2(0.5, 0.55)) * vec2(3.0, 1.3);
+      float r = length(p), a = atan(p.y, p.x), seg = 6.2831853 / 6.0;
+      a = abs(mod(a + uTime * 0.05, seg) - seg * 0.5);
+      vec2 q = vec2(cos(a), sin(a)) * r; float t = uTime * 0.5;
+      float v = (sin(q.x * 6.0 + t) + sin(q.y * 7.0 - t * 1.3) + sin((q.x + q.y) * 5.0 + t * 0.7 + uBass * 3.0)) / 3.0;
+      vec3 c = mix(uC0, uC1, 0.5 + 0.5 * sin(v * 3.14 + t));
+      c = mix(c, uC2, smoothstep(0.55, 1.0, abs(v)));
+      return c * (0.15 + uBass * 1.0) * (0.15 + 0.85 * pow(abs(v), 1.6)) * smoothstep(1.7, 0.15, r) + uC3 * uBeat * 0.2 * smoothstep(0.6, 0.0, r);
+    }
+    vec3 sSkyline(vec2 uv) {
+      float sx = abs(uv.x - 0.5) * 2.0, fx = sx * 32.0;
+      float h = 0.05 + spec(sx) * 0.85, cell = step(0.14, fract(fx)), seg = step(0.3, fract(uv.y * 36.0));
+      vec3 c = mix(uC3, uC0, clamp(uv.y / 0.9, 0.0, 1.0));
+      vec3 col = c * step(uv.y, h) * cell * seg * 1.1;
+      col += uC2 * exp(-abs(uv.y - h) * 40.0) * cell * 0.7;
+      col += uC1 * 0.08 * (1.0 - uv.y) * (0.4 + uBass);
+      return col;
+    }
+    vec3 sRings(vec2 uv) {
+      vec2 p = (uv - vec2(0.5, 0.55)) * vec2(3.0, 1.3);
+      float r = length(p);
+      float w = r * 3.0 - uPhase - uTime * 0.15;
+      float ring = pow(0.5 + 0.5 * cos(fract(w) * 6.2831853), 10.0);
+      float idx = floor(w);
+      vec3 c = mod(idx, 3.0) < 1.0 ? uC0 : mod(idx, 3.0) < 2.0 ? uC1 : uC2;
+      vec3 col = c * ring * (0.2 + uBeat * 1.2 + uBass * 0.5) * smoothstep(1.8, 0.1, r);
+      float y = 0.55 + sin(uv.x * 38.0 + uTime * 3.0) * (0.03 + uMid * 0.18) * sin(uv.x * 3.14159);
+      col += uC3 * exp(-abs(uv.y - y) * 120.0) * (0.4 + uHigh * 1.5);
+      return col + bottomBars(uv, 0.3) * 0.7;
+    }
+    vec3 scene(int id, vec2 uv) {
+      if (id == 1) return sKaleido(uv);
+      if (id == 2) return sSkyline(uv);
+      if (id == 3) return sRings(uv);
+      return sTunnel(uv);
+    }
+    void main(){
+      vec2 uv = vec2(1.0 - vUv.x, vUv.y);
+      vec3 col = scene(uSceneA, uv);
+      if (uFade > 0.001) col = mix(col, scene(uSceneB, uv), uFade);
       vec2 g = fract(vUv * vec2(260.0, 70.0));
       float led = 0.4 + 0.6 * smoothstep(0.0, 0.3, g.x) * smoothstep(0.0, 0.3, g.y) * smoothstep(1.0, 0.7, g.x) * smoothstep(1.0, 0.7, g.y);
       gl_FragColor = vec4(col * led * uInt, 1.0);
@@ -1596,6 +1659,32 @@ const wall = new THREE.Mesh(new THREE.CylinderGeometry(3.4, 3.4, 2.6, 72, 1, tru
     }`,
 }));
 wall.position.y = 1.55; venue.add(wall);
+
+// Scene rotation: the wall look and laser pattern change on a timer, on a phrase boundary when music is playing
+const SCENES = ['Tunnel', 'Kaleidoscope', 'Skyline', 'Rings'];
+const SCENE_EVERY = { '30': 30, '45': 45, '60': 60, '120': 120, '300': 300, '2700': 2700, 'never': 0 };
+let sceneEvery = (() => { try { const v = localStorage.getItem('segue32vr.sceneEvery'); return v in SCENE_EVERY ? v : '45'; } catch (e) { return '45'; } })();
+const vscene = { cur: 0, next: 0, fadeT: -1, lastSwitch: performance.now(), pending: false };
+function nextScene() {
+  if (vscene.fadeT >= 0) return;
+  vscene.next = (vscene.cur + 1) % SCENES.length;
+  vscene.fadeT = performance.now(); vscene.pending = false; vscene.lastSwitch = performance.now(); libDirty = true;
+}
+function updateScene(now, lead) {
+  const every = SCENE_EVERY[sceneEvery];
+  if (every && vscene.fadeT < 0 && now - vscene.lastSwitch > every * 1000) vscene.pending = true;
+  if (vscene.pending) {
+    // wait for the start of a 16-beat phrase if something is playing
+    if (!lead) nextScene();
+    else { const bp = lead.beatPos(), k = ((Math.floor(bp) % 16) + 16) % 16; if (k === 0 && bp - Math.floor(bp) < 0.25) nextScene(); }
+  }
+  let fade = 0;
+  if (vscene.fadeT >= 0) {
+    fade = clamp01((now - vscene.fadeT) / 2500);
+    if (fade >= 1) { vscene.cur = vscene.next; vscene.fadeT = -1; fade = 0; }
+  }
+  wallU.uSceneA.value = vscene.cur; wallU.uSceneB.value = vscene.next; wallU.uFade.value = fade;
+}
 
 // Lasers from a truss behind the booth (also shown in passthrough)
 const lasers = new THREE.Group(); stage.add(lasers);
@@ -1677,6 +1766,8 @@ function updateVisuals(now, dt) {
     if (idx !== feat.lastBeat) { feat.lastBeat = idx; if (bass > 0.25) feat.rippleT = now; }
   }
   feat.beat = beat;
+  wallU.uPhase.value = lead ? ((lead.beatPos() % 1) + 1) % 1 : 0;
+  updateScene(now, lead && lead.level > 0.12 ? lead : null);
   const inten = visMode === 'full' ? 1 : visMode === 'chill' ? 0.45 : 0;
   const t = now / 1000;
   wallU.uTime.value = t; wallU.uBass.value = feat.bass; wallU.uMid.value = feat.mid; wallU.uHigh.value = feat.high; wallU.uBeat.value = beat; wallU.uInt.value = 0.25 + inten * 0.75;
@@ -1686,7 +1777,19 @@ function updateVisuals(now, dt) {
     const live = masterLevel > 0.05 ? 1 : 0;
     for (const b of beams) {
       const i = b.i, sp = visMode === 'full' ? 1 : 0.4;
-      _tgt.set(Math.sin(t * 0.6 * sp + i * 0.7) * 3.5, 0.3 + 0.9 * (0.5 + 0.5 * Math.sin(t * 0.9 * sp + i * 1.9)), 3.5 + Math.sin(t * 0.3 + i));
+      const pat = (vscene.fadeT >= 0 && now - vscene.fadeT > 1250) ? vscene.next : vscene.cur;
+      if (pat === 1) {        // crossing X
+        const side = i % 2 ? 1 : -1;
+        _tgt.set(side * (1.5 + Math.sin(t * 0.8 * sp + i) * 2.5), 0.4 + 0.6 * (0.5 + 0.5 * Math.sin(t * 1.3 * sp + i)), 4.0);
+      } else if (pat === 2) { // fan that opens and closes
+        const spread = 0.5 + 0.5 * Math.sin(t * 0.7 * sp);
+        _tgt.set((i - 4.5) * 0.9 * spread, 0.6 + feat.bass * 0.8, 4.2);
+      } else if (pat === 3) { // up into the room, rotating
+        const an = t * 0.5 * sp + i * 0.628;
+        _tgt.set(Math.cos(an) * 3.0, 3.5 + Math.sin(an) * 0.8, 2.0 + Math.sin(an) * 2.0);
+      } else {                // default sweep
+        _tgt.set(Math.sin(t * 0.6 * sp + i * 0.7) * 3.5, 0.3 + 0.9 * (0.5 + 0.5 * Math.sin(t * 0.9 * sp + i * 1.9)), 3.5 + Math.sin(t * 0.3 + i));
+      }
       _tgt.sub(b.m.position).normalize();
       b.m.quaternion.setFromUnitVectors(UP, _tgt);
       const on = (i % 2 === (feat.lastBeat || 0) % 2) ? 1 : 0.35;
@@ -1753,7 +1856,7 @@ for (const c of controls) if (c.type === 'knob' || c.type === 'fader') c.set(c.v
 setCrossfader(0.5);
 document.fonts && document.fonts.load(`600 20px ${FONT}`).then(() => { surfaceDraws.forEach(f => f()); libDirty = true; }).catch(() => {});
 
-applyPalette(); renderLegend(); visSel.value = visMode; applyEnv();
+applyPalette(); renderLegend(); visSel.value = visMode; sceneSel.value = sceneEvery; applyEnv();
 idbAll().then(recs => {
   for (const r of recs) {
     if (!r.blob || library.some(e => e.id === r.id)) continue;
@@ -1782,7 +1885,7 @@ idbAll().then(recs => {
 })();
 
 // exposed for testing
-window.__segue = { deckA, deckB, detectBPM, synthDemo, controls, setCrossfader, camera, xfader, mixerKnobs, THREE, setWaveStyle, setVisMode, library, directLink, feat };
+window.__segue = { nextScene, vscene, wall, applyEnv, get venueOn() { return venueOn; }, deckA, deckB, detectBPM, synthDemo, controls, setCrossfader, camera, xfader, mixerKnobs, THREE, setWaveStyle, setVisMode, library, directLink, feat };
 </script>
 </body>
 </html>
